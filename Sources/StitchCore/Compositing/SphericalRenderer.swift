@@ -15,6 +15,7 @@ public enum SphericalRenderer {
 
     public static func render(cameras: [Int: Camera],
                               images: [Int: RGBImage],
+                              meshes: [Int: WarpMesh] = [:],
                               outputWidth: Int = 4000) -> Output? {
         guard !cameras.isEmpty else { return nil }
 
@@ -48,9 +49,9 @@ public enum SphericalRenderer {
         let outputHeight = max(1, Int((phiMax - phiMin) * scale))
         var out = RGBImage(width: outputWidth, height: outputHeight)
 
-        let camList = cameras.keys.sorted().compactMap { key -> (Camera, RGBImage)? in
+        let camList = cameras.keys.sorted().compactMap { key -> (Camera, RGBImage, WarpMesh?)? in
             guard let img = images[key] else { return nil }
-            return (cameras[key]!, img)
+            return (cameras[key]!, img, meshes[key])
         }
 
         // Row-parallel accumulation; each row is written by exactly one thread.
@@ -65,10 +66,18 @@ public enum SphericalRenderer {
                             let d = SIMD3(sin(theta) * cosPhi, -sinPhi, cos(theta) * cosPhi)
                             var acc = SIMD3<Float>.zero
                             var wSum: Float = 0
-                            for (cam, img) in camList {
+                            for (cam, img, mesh) in camList {
                                 guard let p = cam.project(d) else { continue }
-                                let px = p.x + Double(cam.width) / 2
-                                let py = p.y + Double(cam.height) / 2
+                                var px = p.x + Double(cam.width) / 2
+                                var py = p.y + Double(cam.height) / 2
+                                // The global model addresses corrected space;
+                                // pull back through the parallax mesh to find
+                                // the actual source pixel: u ≈ p − d(p).
+                                if let mesh {
+                                    let off = mesh.offset(x: px, y: py)
+                                    px -= off.x
+                                    py -= off.y
+                                }
                                 guard px >= 0, px < Double(cam.width) - 1,
                                       py >= 0, py < Double(cam.height) - 1 else { continue }
                                 // Tent weight: 1 at center, 0 at the edges.

@@ -19,7 +19,7 @@ swift build -c release
 .build/release/stitch recognize Images/HiltonHeadHouse
 ```
 
-Status: milestones 1-4 done (SIFT, matching/RANSAC/verification, panorama
-recognition, bundle adjustment + straightening + linear-blend render). Next:
-mesh-based parallax refinement, then gain compensation, graph-cut seams, and
-multi-band blending.
+Status: milestones 1-5 done (SIFT, matching/RANSAC/verification, panorama
+recognition, bundle adjustment + straightening, mesh-based parallax refinement,
+linear-blend render). Next: gain compensation, graph-cut seams, and multi-band
+blending for final output quality.

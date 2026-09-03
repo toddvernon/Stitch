@@ -19,10 +19,10 @@ func usage() -> Never {
           Detect features in every image in a folder and report the recognized
           panoramas (connected components of verified pairs).
 
-      pano <folder> -o <out.png> [--max-dim <N>] [--width <W>]
-          Full pipeline preview: recognize, bundle adjust, straighten, and
-          render the largest panorama with linear blending (output width W,
-          default 4000).
+      pano <folder> -o <out.png> [--max-dim <N>] [--width <W>] [--no-mesh]
+          Full pipeline preview: recognize, bundle adjust, straighten, refine
+          parallax with warp meshes (skip with --no-mesh), and render the
+          largest panorama with linear blending (output width W, default 4000).
 
     options:
       --max-dim <N>    downsample so the longer side is at most N pixels (default 2000)
@@ -229,6 +229,7 @@ func runPano(_ args: [String]) throws {
     var outPath: String?
     var maxDim = 2000
     var outputWidth = 4000
+    var useMesh = true
     var it = args.makeIterator()
     while let arg = it.next() {
         switch arg {
@@ -241,6 +242,8 @@ func runPano(_ args: [String]) throws {
         case "--width":
             guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
             outputWidth = n
+        case "--no-mesh":
+            useMesh = false
         default:
             if arg.hasPrefix("-") || folder != nil { usage() }
             folder = arg
@@ -278,6 +281,15 @@ func runPano(_ args: [String]) throws {
         print("  \(urls[idx].lastPathComponent): f = \(String(format: "%.0f", cam.focal)) px (\(String(format: "%.1f", f35))mm equiv)")
     }
 
+    var meshes: [Int: WarpMesh] = [:]
+    if useMesh {
+        let meshStart = Date()
+        let result = MeshRefiner.refine(group: group, features: features, cameras: alignment.cameras)
+        meshes = result.meshes
+        let maxOff = meshes.values.map(\.maxOffset).max() ?? 0
+        print("mesh refinement: parallax residual \(String(format: "%.2f", result.initialRMS)) → \(String(format: "%.2f", result.finalRMS)) px, max offset \(String(format: "%.1f", maxOff)) px, in \(String(format: "%.2f", Date().timeIntervalSince(meshStart)))s")
+    }
+
     var rgbImages: [Int: RGBImage] = [:]
     for idx in alignment.cameras.keys {
         rgbImages[idx] = try ImageLoader.loadRGB(url: urls[idx], maxDimension: maxDim)
@@ -286,6 +298,7 @@ func runPano(_ args: [String]) throws {
     let renderStart = Date()
     guard let output = SphericalRenderer.render(cameras: alignment.cameras,
                                                 images: rgbImages,
+                                                meshes: meshes,
                                                 outputWidth: outputWidth) else {
         print("render failed")
         exit(1)
