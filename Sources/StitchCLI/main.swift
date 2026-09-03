@@ -26,6 +26,8 @@ func usage() -> Never {
           compensation, graph-cut seams, and multi-band blending, cropped to
           the largest covered rectangle (--no-crop keeps the full sphere
           projection; --linear uses the simple linear-blend preview renderer).
+          Output width defaults to the panorama's natural full resolution
+          (capped at 12000 px); override with --width.
 
     options:
       --max-dim <N>    downsample so the longer side is at most N pixels (default 2000)
@@ -231,7 +233,7 @@ func runPano(_ args: [String]) throws {
     var folder: String?
     var outPath: String?
     var maxDim = 2000
-    var outputWidth = 4000
+    var outputWidth = 0  // 0 = auto (natural full resolution, capped)
     var useMesh = true
     var crop = true
     var linearBlend = false
@@ -299,32 +301,55 @@ func runPano(_ args: [String]) throws {
         print("mesh refinement: parallax residual \(String(format: "%.2f", result.initialRMS)) → \(String(format: "%.2f", result.finalRMS)) px, max offset \(String(format: "%.1f", maxOff)) px, in \(String(format: "%.2f", Date().timeIntervalSince(meshStart)))s")
     }
 
-    var rgbImages: [Int: RGBImage] = [:]
-    for idx in alignment.cameras.keys {
-        rgbImages[idx] = try ImageLoader.loadRGB(url: urls[idx], maxDimension: maxDim)
-    }
-
     let renderStart = Date()
     let finalImage: RGBImage
     let horizontalDegrees: Double
     if linearBlend {
+        var rgbImages: [Int: RGBImage] = [:]
+        for idx in alignment.cameras.keys {
+            rgbImages[idx] = try ImageLoader.loadRGB(url: urls[idx], maxDimension: maxDim)
+        }
         guard let output = SphericalRenderer.render(cameras: alignment.cameras,
                                                     images: rgbImages,
                                                     meshes: meshes,
-                                                    outputWidth: outputWidth) else {
+                                                    outputWidth: outputWidth == 0 ? 4000 : outputWidth) else {
             print("render failed")
             exit(1)
         }
         finalImage = output.image
         horizontalDegrees = (output.thetaRange.upperBound - output.thetaRange.lowerBound) * 180 / .pi
     } else {
+        // Auto output width: the panorama's natural full-resolution span
+        // (angular span × mean focal scaled to source resolution), capped.
+        if outputWidth == 0 {
+            var natural = 4000.0
+            if let geoProbe = PanoGeometry(cameras: alignment.cameras, outputWidth: 1000) {
+                let span = geoProbe.thetaMax - geoProbe.thetaMin
+                var scaledFocals: [Double] = []
+                for (idx, cam) in alignment.cameras {
+                    if let dims = ImageLoader.pixelDimensions(url: urls[idx]) {
+                        let fullLong = Double(max(dims.width, dims.height))
+                        let regLong = Double(max(cam.width, cam.height))
+                        scaledFocals.append(cam.focal * fullLong / regLong)
+                    }
+                }
+                if !scaledFocals.isEmpty {
+                    let fMean = scaledFocals.reduce(0, +) / Double(scaledFocals.count)
+                    natural = span * fMean
+                }
+            }
+            outputWidth = min(Int(natural), 12000)
+            print("output width (auto): \(outputWidth) px")
+        }
         var options = Compositor.Options()
         options.outputWidth = outputWidth
         options.crop = crop
-        guard let result = Compositor.compose(cameras: alignment.cameras,
-                                              images: rgbImages,
-                                              meshes: meshes,
-                                              options: options) else {
+        guard let result = try Compositor.compose(cameras: alignment.cameras,
+                                                  meshes: meshes,
+                                                  options: options,
+                                                  imageProvider: { idx, maxDimension in
+            try ImageLoader.loadRGB(url: urls[idx], maxDimension: maxDimension)
+        }) else {
             print("compositing failed")
             exit(1)
         }

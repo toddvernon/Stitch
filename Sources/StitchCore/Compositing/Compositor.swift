@@ -9,6 +9,8 @@ public enum Compositor {
         public var outputWidth = 4000
         /// Working width for gain/seam estimation.
         public var seamWidth = 1200
+        /// Long-side cap when loading sources for the low-res gain/seam pass.
+        public var seamSourceDimension = 1200
         public var blendLevels = 5
         public var crop = true
         public init() {}
@@ -20,10 +22,13 @@ public enum Compositor {
         public var geometry: PanoGeometry
     }
 
+    /// `imageProvider(index, maxDimension)` loads a source image, optionally
+    /// downsampled; images are requested one at a time so full-resolution
+    /// sources never need to be resident together.
     public static func compose(cameras: [Int: Camera],
-                               images: [Int: RGBImage],
                                meshes: [Int: WarpMesh],
-                               options: Options = Options()) -> Result? {
+                               options: Options = Options(),
+                               imageProvider: (Int, Int?) throws -> RGBImage) rethrows -> Result? {
         guard let geoFull = PanoGeometry(cameras: cameras, outputWidth: options.outputWidth) else { return nil }
         let geoLow = geoFull.scaled(toWidth: min(options.seamWidth, options.outputWidth))
         let indices = cameras.keys.sorted()
@@ -31,8 +36,8 @@ public enum Compositor {
         // Low-res layers for gain + seams.
         var lowLayers: [ImageLayer] = []
         for idx in indices {
-            guard let img = images[idx],
-                  let layer = LayerProjector.project(imageIndex: idx, camera: cameras[idx]!,
+            let img = try imageProvider(idx, options.seamSourceDimension)
+            guard let layer = LayerProjector.project(imageIndex: idx, camera: cameras[idx]!,
                                                      image: img, mesh: meshes[idx],
                                                      geometry: geoLow) else { continue }
             lowLayers.append(layer)
@@ -51,8 +56,8 @@ public enum Compositor {
                                        levels: options.blendLevels)
         let sx = Double(geoLow.width) / Double(geoFull.width)
         for idx in indices {
-            guard let img = images[idx],
-                  var layer = LayerProjector.project(imageIndex: idx, camera: cameras[idx]!,
+            let img = try imageProvider(idx, nil)
+            guard var layer = LayerProjector.project(imageIndex: idx, camera: cameras[idx]!,
                                                      image: img, mesh: meshes[idx],
                                                      geometry: geoFull) else { continue }
             GainCompensator.apply(gain: gains[idx] ?? 1, to: &layer)
@@ -77,26 +82,10 @@ public enum Compositor {
         if options.crop {
             let rect = largestCoveredRect(coverage: blender.coverage)
             if rect.w > geoFull.width / 4, rect.h > geoFull.height / 4 {
-                image = cropped(image, x0: rect.x, y0: rect.y, width: rect.w, height: rect.h)
+                image = image.cropped(x0: rect.x, y0: rect.y, width: rect.w, height: rect.h)
             }
         }
         return Result(image: image, gains: gains, geometry: geoFull)
-    }
-
-    // MARK: - Crop
-
-    static func cropped(_ img: RGBImage, x0: Int, y0: Int, width: Int, height: Int) -> RGBImage {
-        var out = RGBImage(width: width, height: height)
-        for y in 0..<height {
-            for x in 0..<width {
-                let si = (y0 + y) * img.width + (x0 + x)
-                let di = y * width + x
-                out.r.pixels[di] = img.r.pixels[si]
-                out.g.pixels[di] = img.g.pixels[si]
-                out.b.pixels[di] = img.b.pixels[si]
-            }
-        }
-        return out
     }
 
     /// Largest axis-aligned rectangle containing only covered pixels

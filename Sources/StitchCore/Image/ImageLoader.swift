@@ -59,6 +59,17 @@ public enum ImageLoader {
         return ImageF(width: w, height: h, pixels: floats)
     }
 
+    /// Stored pixel dimensions without decoding the image.
+    public static func pixelDimensions(url: URL) -> (width: Int, height: Int)? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int else {
+            return nil
+        }
+        return (w, h)
+    }
+
     /// EXIF 35mm-equivalent focal length if present (for bundle-adjustment init later).
     public static func focalLength35mm(url: URL) -> Double? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),

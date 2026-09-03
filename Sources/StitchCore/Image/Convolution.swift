@@ -82,6 +82,25 @@ public enum Convolution {
         return out
     }
 
+    /// Bilinear-quality resampling via vImage.
+    public static func resize(_ image: ImageF, width: Int, height: Int) -> ImageF {
+        if image.width == width && image.height == height { return image }
+        var src = image
+        var dst = ImageF(width: width, height: height)
+        src.pixels.withUnsafeMutableBufferPointer { sp in
+            dst.pixels.withUnsafeMutableBufferPointer { dp in
+                var sbuf = vImage_Buffer(data: sp.baseAddress!, height: vImagePixelCount(image.height),
+                                         width: vImagePixelCount(image.width),
+                                         rowBytes: image.width * MemoryLayout<Float>.size)
+                var dbuf = vImage_Buffer(data: dp.baseAddress!, height: vImagePixelCount(height),
+                                         width: vImagePixelCount(width),
+                                         rowBytes: width * MemoryLayout<Float>.size)
+                vImageScale_PlanarF(&sbuf, &dbuf, nil, vImage_Flags(kvImageEdgeExtend))
+            }
+        }
+        return dst
+    }
+
     public static func subtract(_ a: ImageF, _ b: ImageF) -> ImageF {
         precondition(a.width == b.width && a.height == b.height)
         var out = ImageF(width: a.width, height: a.height)

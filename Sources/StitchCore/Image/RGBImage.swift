@@ -28,6 +28,20 @@ public struct RGBImage {
         SIMD3(r.sample(x: x, y: y), g.sample(x: x, y: y), b.sample(x: x, y: y))
     }
 
+    public func cropped(x0: Int, y0: Int, width: Int, height: Int) -> RGBImage {
+        var out = RGBImage(width: width, height: height)
+        for y in 0..<height {
+            for x in 0..<width {
+                let si = (y0 + y) * self.width + (x0 + x)
+                let di = y * width + x
+                out.r.pixels[di] = r.pixels[si]
+                out.g.pixels[di] = g.pixels[si]
+                out.b.pixels[di] = b.pixels[si]
+            }
+        }
+        return out
+    }
+
     public func makeCGImage() -> CGImage {
         let w = width, h = height
         var rgba = [UInt8](repeating: 255, count: w * h * 4)
