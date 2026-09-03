@@ -20,9 +20,12 @@ func usage() -> Never {
           panoramas (connected components of verified pairs).
 
       pano <folder> -o <out.png> [--max-dim <N>] [--width <W>] [--no-mesh]
-          Full pipeline preview: recognize, bundle adjust, straighten, refine
-          parallax with warp meshes (skip with --no-mesh), and render the
-          largest panorama with linear blending (output width W, default 4000).
+                    [--no-crop] [--linear]
+          Full pipeline: recognize, bundle adjust, straighten, refine parallax
+          with warp meshes (skip with --no-mesh), then composite with gain
+          compensation, graph-cut seams, and multi-band blending, cropped to
+          the largest covered rectangle (--no-crop keeps the full sphere
+          projection; --linear uses the simple linear-blend preview renderer).
 
     options:
       --max-dim <N>    downsample so the longer side is at most N pixels (default 2000)
@@ -230,6 +233,8 @@ func runPano(_ args: [String]) throws {
     var maxDim = 2000
     var outputWidth = 4000
     var useMesh = true
+    var crop = true
+    var linearBlend = false
     var it = args.makeIterator()
     while let arg = it.next() {
         switch arg {
@@ -244,6 +249,10 @@ func runPano(_ args: [String]) throws {
             outputWidth = n
         case "--no-mesh":
             useMesh = false
+        case "--no-crop":
+            crop = false
+        case "--linear":
+            linearBlend = true
         default:
             if arg.hasPrefix("-") || folder != nil { usage() }
             folder = arg
@@ -296,18 +305,40 @@ func runPano(_ args: [String]) throws {
     }
 
     let renderStart = Date()
-    guard let output = SphericalRenderer.render(cameras: alignment.cameras,
-                                                images: rgbImages,
-                                                meshes: meshes,
-                                                outputWidth: outputWidth) else {
-        print("render failed")
-        exit(1)
+    let finalImage: RGBImage
+    let horizontalDegrees: Double
+    if linearBlend {
+        guard let output = SphericalRenderer.render(cameras: alignment.cameras,
+                                                    images: rgbImages,
+                                                    meshes: meshes,
+                                                    outputWidth: outputWidth) else {
+            print("render failed")
+            exit(1)
+        }
+        finalImage = output.image
+        horizontalDegrees = (output.thetaRange.upperBound - output.thetaRange.lowerBound) * 180 / .pi
+    } else {
+        var options = Compositor.Options()
+        options.outputWidth = outputWidth
+        options.crop = crop
+        guard let result = Compositor.compose(cameras: alignment.cameras,
+                                              images: rgbImages,
+                                              meshes: meshes,
+                                              options: options) else {
+            print("compositing failed")
+            exit(1)
+        }
+        let gainsText = result.gains.keys.sorted()
+            .map { String(format: "%.2f", result.gains[$0]!) }
+            .joined(separator: " ")
+        print("gain compensation: [\(gainsText)]")
+        finalImage = result.image
+        horizontalDegrees = (result.geometry.thetaMax - result.geometry.thetaMin) * 180 / .pi
     }
-    let degrees = (output.thetaRange.upperBound - output.thetaRange.lowerBound) * 180 / .pi
-    print("rendered \(output.image.width)x\(output.image.height) (\(String(format: "%.0f", degrees))° horizontal) in \(String(format: "%.2f", Date().timeIntervalSince(renderStart)))s")
+    print("rendered \(finalImage.width)x\(finalImage.height) (\(String(format: "%.0f", horizontalDegrees))° span) in \(String(format: "%.2f", Date().timeIntervalSince(renderStart)))s")
 
     let outURL = URL(fileURLWithPath: outPath)
-    try ImageLoader.writePNG(output.image.makeCGImage(), to: outURL)
+    try ImageLoader.writePNG(finalImage.makeCGImage(), to: outURL)
     print("panorama: \(outURL.path)")
 }
 

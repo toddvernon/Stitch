@@ -19,7 +19,8 @@ swift build -c release
 .build/release/stitch recognize Images/HiltonHeadHouse
 ```
 
-Status: milestones 1-5 done (SIFT, matching/RANSAC/verification, panorama
-recognition, bundle adjustment + straightening, mesh-based parallax refinement,
-linear-blend render). Next: gain compensation, graph-cut seams, and multi-band
-blending for final output quality.
+Status: milestones 1-6 done — the full stitching pipeline: SIFT, matching/
+RANSAC/verification, panorama recognition, bundle adjustment + straightening,
+mesh-based parallax refinement, gain compensation, graph-cut seams, multi-band
+blending, and auto-crop. Next: the SwiftUI app, full-resolution output, and
+performance work on the blender.

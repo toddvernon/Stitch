@@ -147,8 +147,8 @@ an optional non-core module.
 3. **Panorama recognition** on a messy folder. ✓
 4. **Bundle adjustment + straightening**, crude linear-blend render to verify alignment. ✓
 5. **Mesh refinement** (the railing fix). ✓
-6. **Gain + graph-cut seams + multi-band blending** — full-quality output. ← *current*
-7. **SwiftUI app**.
+6. **Gain + graph-cut seams + multi-band blending** — full-quality output. ✓
+7. **SwiftUI app**. ← *current*
 
 ## References
 
