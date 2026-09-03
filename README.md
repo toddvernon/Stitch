@@ -10,8 +10,16 @@ Requires macOS 14+. No dependencies.
 ```sh
 swift build -c release
 
-# Milestone 1: SIFT feature detection with a debug overlay
+# Stitch a folder of photos into a panorama (linear-blend preview quality)
+.build/release/stitch pano Images/HiltonHeadHouse -o pano.png
+
+# Inspect the pipeline stage by stage
 .build/release/stitch features photo.jpg --debug-out keypoints.png
+.build/release/stitch match a.jpg b.jpg --debug-out matches.png
+.build/release/stitch recognize Images/HiltonHeadHouse
 ```
 
-Status: milestone 1 (SIFT feature extraction) in progress.
+Status: milestones 1-4 done (SIFT, matching/RANSAC/verification, panorama
+recognition, bundle adjustment + straightening + linear-blend render). Next:
+mesh-based parallax refinement, then gain compensation, graph-cut seams, and
+multi-band blending.

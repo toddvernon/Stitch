@@ -15,6 +15,15 @@ func usage() -> Never {
           RANSAC, and run pair verification. Optionally writes a side-by-side
           PNG with inlier (green) and outlier (red) correspondences.
 
+      recognize <folder> [--max-dim <N>]
+          Detect features in every image in a folder and report the recognized
+          panoramas (connected components of verified pairs).
+
+      pano <folder> -o <out.png> [--max-dim <N>] [--width <W>]
+          Full pipeline preview: recognize, bundle adjust, straighten, and
+          render the largest panorama with linear blending (output width W,
+          default 4000).
+
     options:
       --max-dim <N>    downsample so the longer side is at most N pixels (default 2000)
       --double         double the image before detection (more features, 4x slower)
@@ -146,6 +155,149 @@ func runMatch(_ args: [String]) throws {
     }
 }
 
+func imageURLs(in folder: String) throws -> [URL] {
+    let extensions = Set(["jpg", "jpeg", "png", "heic", "tif", "tiff"])
+    let contents = try FileManager.default.contentsOfDirectory(
+        at: URL(fileURLWithPath: folder), includingPropertiesForKeys: nil)
+    return contents
+        .filter { extensions.contains($0.pathExtension.lowercased()) }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+}
+
+/// Shared front half of recognize/pano: load, detect, recognize.
+func recognizePanoramas(folder: String, maxDim: Int) throws
+    -> (urls: [URL], images: [ImageF], features: [[Feature]], groups: [PanoramaGroup]) {
+    let urls = try imageURLs(in: folder)
+    guard urls.count >= 2 else {
+        print("need at least 2 images in \(folder)")
+        exit(1)
+    }
+    var images: [ImageF] = []
+    var features: [[Feature]] = []
+    let detector = SIFTDetector()
+    for url in urls {
+        let img = try ImageLoader.loadGrayscale(url: url, maxDimension: maxDim)
+        let f = detector.detect(in: img)
+        print("  \(url.lastPathComponent): \(img.width)x\(img.height), \(f.count) features")
+        images.append(img)
+        features.append(f)
+    }
+    let sizes = images.map { (width: $0.width, height: $0.height) }
+    let start = Date()
+    let groups = PanoramaRecognizer.recognize(features: features, imageSizes: sizes)
+    print("recognition: \(String(format: "%.2f", Date().timeIntervalSince(start)))s")
+    return (urls, images, features, groups)
+}
+
+func runRecognize(_ args: [String]) throws {
+    var folder: String?
+    var maxDim = 2000
+    var it = args.makeIterator()
+    while let arg = it.next() {
+        switch arg {
+        case "--max-dim":
+            guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
+            maxDim = n
+        default:
+            if arg.hasPrefix("-") || folder != nil { usage() }
+            folder = arg
+        }
+    }
+    guard let folder else { usage() }
+    let (urls, _, _, groups) = try recognizePanoramas(folder: folder, maxDim: maxDim)
+
+    if groups.isEmpty {
+        print("no panoramas recognized")
+        return
+    }
+    for (i, group) in groups.enumerated() {
+        let names = group.imageIndices.sorted().map { urls[$0].lastPathComponent }.joined(separator: ", ")
+        print("panorama \(i + 1): \(group.imageIndices.count) images (\(names))")
+        for p in group.pairs {
+            print("    \(urls[p.indexA].lastPathComponent) <-> \(urls[p.indexB].lastPathComponent): \(p.geometry.inlierIndices.count) inliers")
+        }
+    }
+    let matched = Set(groups.flatMap(\.imageIndices))
+    let noise = (0..<urls.count).filter { !matched.contains($0) }
+    if !noise.isEmpty {
+        print("unmatched: \(noise.map { urls[$0].lastPathComponent }.joined(separator: ", "))")
+    }
+}
+
+func runPano(_ args: [String]) throws {
+    var folder: String?
+    var outPath: String?
+    var maxDim = 2000
+    var outputWidth = 4000
+    var it = args.makeIterator()
+    while let arg = it.next() {
+        switch arg {
+        case "-o", "--out":
+            guard let v = it.next() else { usage() }
+            outPath = v
+        case "--max-dim":
+            guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
+            maxDim = n
+        case "--width":
+            guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
+            outputWidth = n
+        default:
+            if arg.hasPrefix("-") || folder != nil { usage() }
+            folder = arg
+        }
+    }
+    guard let folder, let outPath else { usage() }
+
+    let (urls, images, features, groups) = try recognizePanoramas(folder: folder, maxDim: maxDim)
+    guard let group = groups.first else {
+        print("no panorama recognized")
+        exit(1)
+    }
+    print("largest panorama: \(group.imageIndices.count) of \(urls.count) images")
+
+    // EXIF focal hints, converted to registration-scale pixels.
+    var focalHints: [Int: Double] = [:]
+    for idx in group.imageIndices {
+        if let f35 = ImageLoader.focalLength35mm(url: urls[idx]) {
+            let longSide = Double(max(images[idx].width, images[idx].height))
+            focalHints[idx] = f35 / 36.0 * longSide
+        }
+    }
+
+    let sizes = images.map { (width: $0.width, height: $0.height) }
+    let alignStart = Date()
+    guard let alignment = PanoramaAligner.align(group: group, features: features,
+                                                imageSizes: sizes, focalHints: focalHints) else {
+        print("alignment failed")
+        exit(1)
+    }
+    print("bundle adjustment: RMS \(String(format: "%.2f", alignment.finalRMS)) px in \(String(format: "%.2f", Date().timeIntervalSince(alignStart)))s")
+    for idx in alignment.cameras.keys.sorted() {
+        let cam = alignment.cameras[idx]!
+        let f35 = cam.focal * 36.0 / Double(max(cam.width, cam.height))
+        print("  \(urls[idx].lastPathComponent): f = \(String(format: "%.0f", cam.focal)) px (\(String(format: "%.1f", f35))mm equiv)")
+    }
+
+    var rgbImages: [Int: RGBImage] = [:]
+    for idx in alignment.cameras.keys {
+        rgbImages[idx] = try ImageLoader.loadRGB(url: urls[idx], maxDimension: maxDim)
+    }
+
+    let renderStart = Date()
+    guard let output = SphericalRenderer.render(cameras: alignment.cameras,
+                                                images: rgbImages,
+                                                outputWidth: outputWidth) else {
+        print("render failed")
+        exit(1)
+    }
+    let degrees = (output.thetaRange.upperBound - output.thetaRange.lowerBound) * 180 / .pi
+    print("rendered \(output.image.width)x\(output.image.height) (\(String(format: "%.0f", degrees))° horizontal) in \(String(format: "%.2f", Date().timeIntervalSince(renderStart)))s")
+
+    let outURL = URL(fileURLWithPath: outPath)
+    try ImageLoader.writePNG(output.image.makeCGImage(), to: outURL)
+    print("panorama: \(outURL.path)")
+}
+
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else { usage() }
 
@@ -155,6 +307,10 @@ do {
         try runFeatures(Array(arguments.dropFirst()))
     case "match":
         try runMatch(Array(arguments.dropFirst()))
+    case "recognize":
+        try runRecognize(Array(arguments.dropFirst()))
+    case "pano":
+        try runPano(Array(arguments.dropFirst()))
     default:
         usage()
     }

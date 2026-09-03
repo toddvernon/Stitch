@@ -142,11 +142,11 @@ an optional non-core module.
 
 ## Milestones
 
-1. **SIFT**: extraction with CLI debug rendering of keypoints. ← *current*
-2. **Matching + RANSAC + verification** on two overlapping shots.
-3. **Panorama recognition** on a messy folder.
-4. **Bundle adjustment + straightening**, crude linear-blend render to verify alignment.
-5. **Mesh refinement** (the railing fix).
+1. **SIFT**: extraction with CLI debug rendering of keypoints. ✓
+2. **Matching + RANSAC + verification** on two overlapping shots. ✓
+3. **Panorama recognition** on a messy folder. ✓
+4. **Bundle adjustment + straightening**, crude linear-blend render to verify alignment. ✓
+5. **Mesh refinement** (the railing fix). ← *current*
 6. **Gain + graph-cut seams + multi-band blending** — full-quality output.
 7. **SwiftUI app**.
 
