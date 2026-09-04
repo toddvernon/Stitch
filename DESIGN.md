@@ -95,9 +95,9 @@ Stitch/
 │   ├── StitchCore/          # the library; no UI, no I/O policy, every stage testable
 │   │   ├── Image/           # planar float images, Image I/O loading, EXIF, debug rendering
 │   │   ├── Features/        # SIFT (FeatureExtractor protocol + SIFTDetector)
-│   │   ├── Matching/        # k-d tree, RANSAC, pair verification, panorama recognition
-│   │   ├── Geometry/        # camera model, bundle adjustment, straightening, mesh warp
-│   │   └── Compositing/     # gain, seams (max-flow), multi-band blend, spherical render
+│   │   ├── Matching/        # k-d tree, RANSAC (homography or similarity), verification, recognition
+│   │   ├── Geometry/        # camera model, bundle adjustment, straightening, mesh warp, strip solve
+│   │   └── Compositing/     # LayerSource (pano or strip), gain, seams (max-flow), multi-band blend
 │   └── StitchCLI/           # `stitch` command-line tool; drives the pipeline, test harness
 ├── Tests/StitchCoreTests/
 ├── docs/                    # Brown & Lowe papers, this file’s references
@@ -149,6 +149,7 @@ an optional non-core module.
 5. **Mesh refinement** (the railing fix). ✓
 6. **Gain + graph-cut seams + multi-band blending** — full-quality output. ✓
 7. **SwiftUI app**. ✓
+8. **Strip mode** (multi-viewpoint linear panoramas, below). ✓
 
 All milestones complete. Open items: radial distortion in bundle adjustment,
 memory streaming in the blender, golden-image CI tests, app icon.
@@ -178,7 +179,7 @@ References:
   Projections for Wide-Angle Images.* SIGGRAPH 2009. (The locally-adaptive
   mesh approach; noted as a possible future upgrade, not implemented.)
 
-## Future: `stitch strip` — multi-viewpoint linear panoramas
+## `stitch strip` — multi-viewpoint linear panoramas
 
 The walk-down-the-beach case: photograph each house from in front of it,
 moving between shots, and produce one very long image of the whole row.
@@ -189,25 +190,55 @@ approach (Agarwala et al., SIGGRAPH 2006) embraces that: build a
 photo taken most directly in front of it, in the spirit of a pushbroom /
 slit-scan camera.
 
-Sketch of a Stitch implementation, as a distinct mode beside `pano`:
+Stitch implements this as a distinct mode beside `pano` (`stitch strip`, or
+`--mode strip`; `--mode auto`, the default, recognizes both ways and keeps
+whichever places more images):
 
-1. Pairwise matching as today; RANSAC naturally locks onto the dominant
-   plane (the facades), giving planar homographies per adjacent pair.
-2. Instead of rotational bundle adjustment, chain the pairwise homographies
-   with a gauge that keeps verticals vertical and scale consistent
-   (full structure-from-motion, as in the paper, improves strip placement
-   but is not required for a first version).
-3. Render onto the dominant plane rather than the sphere.
-4. The existing graph-cut seam finder + multi-band blender then perform the
-   multi-viewpoint selection — in the 2006 paper the per-pixel choice of
-   source photo *is* the heart of the method, and our seam machinery is the
-   same mechanism with a viewpoint-locality preference added to the data term.
+1. **Matching** as today, at 3000 px registration rather than 2000: the
+   usable content of a facade strip is a thin band of distant houses and
+   trees, and it needs the extra resolution to yield matches at all.
+2. **Pair model: similarity**, not homography. With the camera held square
+   to the facade, the dominant plane maps between adjacent shots by a
+   translation plus small rotation and scale. Two-point RANSAC samples find
+   that model when only a dozen of a hundred putative matches are real, a
+   regime where four-point homography sampling fails outright (BeachWalk:
+   5–8 "inliers" of garbage homographies vs 10–15 correct similarities).
+   The inlier threshold is loose (0.6% of the long side) so the slight
+   depth spread of the facade band doesn't split the true matches into
+   competing models; verification is a flat minimum of 8 inliers plus
+   sanity limits (scale 0.5–2, rotation under 20°).
+3. **Global placement**: one similarity per image onto the strip frame,
+   solved from every verified pair's inliers as a single linear least-
+   squares problem (a similarity is linear in its four parameters), with
+   Huber IRLS. Gauge: mean rotation zero, mean scale one — "the camera was
+   held level" rather than "the walk was straight", since photographers
+   are better at the former. Skip pairs (i, i+2) participate when they
+   verify, which stiffens the chain.
+4. **Rendering onto the plane**: `StripGeometry` is a second `LayerSource`
+   beside the rotational `PanoLayerSource`; the compositor is generic over
+   that protocol, so gain compensation, seams, blending, and crop are the
+   same code.
+5. **Seams with viewpoint locality**: the graph cut gains a data term
+   λ·(1 − tent) per pixel charging for the use of an image far from its
+   center. In textured regions the smoothness term still routes the cut;
+   in sand and sky, where any cut is free, it makes the seam fall where
+   the two viewpoints cross rather than wherever the solver happened to
+   land — without it, a seam wandered through a house and duplicated it.
+   This *is* the multi-viewpoint selection of the 2006 paper, done by
+   the seam machinery we already had.
+6. **Blending** with 8 pyramid levels instead of 5: a strip's exposure
+   differences are local (the sun angle on the sand changes as you walk),
+   so gain compensation can't remove them and the blend has to spread what
+   remains over hundreds of pixels. With 5 levels a vertical band showed in
+   the sky.
 
 Known intrinsic limits (not engineering gaps): content far off the dominant
 plane duplicates, truncates, or stretches (near foreground is the
 troublemaker; distant background is easy); a curved walking path bends the
-output; moving subjects rely on seams routing around them. Shooting guidance:
-~50% overlap, camera held square to the facade line.
+output; moving subjects rely on seams routing around them. Shooting
+guidance: ~50% overlap, camera held square to the facade line, and don't
+drop frames — a two-frame gap in BeachWalk left the last photo with no
+overlap to anything.
 
 References:
 

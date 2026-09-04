@@ -16,14 +16,17 @@ public struct PanoramaGroup {
 
 /// Brown & Lowe panorama recognition (IJCV 2007 §3): match candidate pairs,
 /// verify them geometrically, and take connected components. Images in no
-/// component (noise images) are simply absent from the result.
+/// component (noise images) are simply absent from the result. The same
+/// procedure recognizes multi-viewpoint strips when run with the similarity
+/// model (see `PairModel`).
 public enum PanoramaRecognizer {
 
     /// Candidate pairs per image, by raw match count (m in the paper).
     public static let candidatesPerImage = 6
 
     public static func recognize(features: [[Feature]],
-                                 imageSizes: [(width: Int, height: Int)]) -> [PanoramaGroup] {
+                                 imageSizes: [(width: Int, height: Int)],
+                                 model: PairModel = .homography) -> [PanoramaGroup] {
         let n = features.count
         guard n >= 2 else { return [] }
 
@@ -58,7 +61,8 @@ public enum PanoramaRecognizer {
             guard let geometry = PairEstimator.estimate(featuresA: features[i], featuresB: features[j],
                                                         matches: matches,
                                                         imageBWidth: imageSizes[j].width,
-                                                        imageBHeight: imageSizes[j].height),
+                                                        imageBHeight: imageSizes[j].height,
+                                                        model: model),
                   geometry.isVerified else { continue }
             pairs.append(VerifiedPair(indexA: i, indexB: j, matches: matches, geometry: geometry))
         }

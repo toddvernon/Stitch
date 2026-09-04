@@ -10,17 +10,20 @@ func usage(exitCode: Int32 = 64) -> Never {
           Detect SIFT features in an image. Prints a summary; optionally writes
           a PNG with keypoints overlaid.
 
-      match <imageA> <imageB> [--debug-out <path.png>] [--max-dim <N>]
+      match <imageA> <imageB> [--debug-out <path.png>] [--max-dim <N>] [--strip]
           Match SIFT features between two images, estimate the homography with
           RANSAC, and run pair verification. Optionally writes a side-by-side
           PNG with inlier (green) and outlier (red) correspondences.
 
-      recognize <folder> [--max-dim <N>]
+      recognize <folder> [--max-dim <N>] [--strip]
           Detect features in every image in a folder and report the recognized
-          panoramas (connected components of verified pairs).
+          panoramas (connected components of verified pairs). --strip uses the
+          similarity model and strip verification instead.
 
       pano <folder> -o <out.png|jpg|tiff> [--max-dim <N>] [--width <W>]
-                    [--no-mesh] [--no-crop] [--projection <p>]
+                    [--no-mesh] [--no-crop] [--projection <p>] [--mode <m>]
+          --mode: auto (default), panorama, or strip. Auto recognizes both
+          ways and keeps whichever places more images.
           --projection: spherical, cylindrical, pannini, or auto (default:
           pannini under 160° of span for a natural perspective look,
           spherical above).
@@ -31,6 +34,19 @@ func usage(exitCode: Int32 = 64) -> Never {
           projection). Every recognized panorama is written (extras suffixed
           .2, .3, …). Output width defaults to the panorama's natural full
           resolution (capped at 12000 px); override with --width.
+
+      strip <folder> -o <out.png|jpg|tiff> [--max-dim <N>] [--width <W>]
+                     [--no-crop] [--locality <w>] [--blend-levels <n>]
+          Multi-viewpoint strip: photos taken walking along a row of houses
+          (or any long facade), each from in front of its subject. Images are
+          placed on the facade plane by similarity transforms solved globally,
+          then composited with graph-cut seams that prefer the photo taken
+          most directly in front of each region, and multi-band blending.
+          Same as `pano --mode strip`. Natural width is capped at 20000 px;
+          registration runs at 3000 px unless --max-dim says otherwise.
+          --locality tunes the seam preference for the nearest-center photo
+          (default 0.01; 0 = pure graph cut), --blend-levels the blend
+          pyramid depth (default 8).
 
     options:
       --max-dim <N>    downsample so the longer side is at most N pixels (default 2000)
@@ -99,6 +115,7 @@ func runMatch(_ args: [String]) throws {
     var inputPaths: [String] = []
     var debugOut: String?
     var maxDim = 2000
+    var model = PairModel.homography
 
     var it = args.makeIterator()
     while let arg = it.next() {
@@ -109,6 +126,8 @@ func runMatch(_ args: [String]) throws {
         case "--max-dim":
             guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
             maxDim = n
+        case "--strip":
+            model = .similarity
         default:
             if arg.hasPrefix("-") || inputPaths.count >= 2 { usage() }
             inputPaths.append(arg)
@@ -137,8 +156,9 @@ func runMatch(_ args: [String]) throws {
     guard let geometry = PairEstimator.estimate(featuresA: featuresA, featuresB: featuresB,
                                                 matches: matches,
                                                 imageBWidth: imageB.width,
-                                                imageBHeight: imageB.height) else {
-        print("no homography could be estimated — images likely do not overlap")
+                                                imageBHeight: imageB.height,
+                                                model: model) else {
+        print("no \(model.rawValue) could be estimated — images likely do not overlap")
         return
     }
 
@@ -146,7 +166,12 @@ func runMatch(_ args: [String]) throws {
     let nf = geometry.overlapMatchCount
     let threshold = PairEstimator.verificationAlpha + PairEstimator.verificationBeta * Double(nf)
     print("RANSAC inliers: \(ni) of \(matches.count), matches in overlap: \(nf)")
-    print("verification: n_i=\(ni) \(geometry.isVerified ? ">" : "<=") \(String(format: "%.1f", threshold))  →  \(geometry.isVerified ? "MATCH" : "NO MATCH")")
+    if model == .similarity, let sim = geometry.similarity {
+        print("verification (strip): n_i=\(ni) \(geometry.isVerified ? ">=" : "<") \(PairEstimator.similarityMinInliers)  →  \(geometry.isVerified ? "MATCH" : "NO MATCH")")
+        print("similarity: scale \(String(format: "%.3f", sim.scale)), rotation \(String(format: "%.2f", sim.rotation * 180 / .pi))°, translation (\(String(format: "%.0f", sim.tx)), \(String(format: "%.0f", sim.ty)))")
+    } else {
+        print("verification: n_i=\(ni) \(geometry.isVerified ? ">" : "<=") \(String(format: "%.1f", threshold))  →  \(geometry.isVerified ? "MATCH" : "NO MATCH")")
+    }
 
     let h = geometry.homography
     for r in 0..<3 {
@@ -164,7 +189,7 @@ func runMatch(_ args: [String]) throws {
 }
 
 /// Shared front half of recognize/pano: load, detect, recognize.
-func recognizePanoramas(folder: String, maxDim: Int) throws
+func recognizePanoramas(folder: String, maxDim: Int, model: PairModel = .homography) throws
     -> (urls: [URL], images: [ImageF], features: [[Feature]], groups: [PanoramaGroup]) {
     let urls = Stitcher.imageURLs(from: [URL(fileURLWithPath: folder)])
     guard urls.count >= 2 else {
@@ -183,7 +208,7 @@ func recognizePanoramas(folder: String, maxDim: Int) throws
     }
     let sizes = images.map { (width: $0.width, height: $0.height) }
     let start = Date()
-    let groups = PanoramaRecognizer.recognize(features: features, imageSizes: sizes)
+    let groups = PanoramaRecognizer.recognize(features: features, imageSizes: sizes, model: model)
     print("recognition: \(String(format: "%.2f", Date().timeIntervalSince(start)))s")
     return (urls, images, features, groups)
 }
@@ -191,19 +216,22 @@ func recognizePanoramas(folder: String, maxDim: Int) throws
 func runRecognize(_ args: [String]) throws {
     var folder: String?
     var maxDim = 2000
+    var model = PairModel.homography
     var it = args.makeIterator()
     while let arg = it.next() {
         switch arg {
         case "--max-dim":
             guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
             maxDim = n
+        case "--strip":
+            model = .similarity
         default:
             if arg.hasPrefix("-") || folder != nil { usage() }
             folder = arg
         }
     }
     guard let folder else { usage() }
-    let (urls, _, _, groups) = try recognizePanoramas(folder: folder, maxDim: maxDim)
+    let (urls, _, _, groups) = try recognizePanoramas(folder: folder, maxDim: maxDim, model: model)
 
     if groups.isEmpty {
         print("no panoramas recognized")
@@ -223,10 +251,11 @@ func runRecognize(_ args: [String]) throws {
     }
 }
 
-func runPano(_ args: [String]) throws {
+func runPano(_ args: [String], mode: Stitcher.Mode = .auto) throws {
     var folder: String?
     var outPath: String?
     var settings = Stitcher.Settings()
+    settings.mode = mode
     var it = args.makeIterator()
     while let arg = it.next() {
         switch arg {
@@ -236,6 +265,7 @@ func runPano(_ args: [String]) throws {
         case "--max-dim":
             guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
             settings.registrationMaxDimension = n
+            settings.stripRegistrationMaxDimension = n
         case "--width":
             guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
             settings.outputWidth = n
@@ -252,6 +282,15 @@ func runPano(_ args: [String]) throws {
             } else {
                 usage()
             }
+        case "--mode":
+            guard let v = it.next(), let m = Stitcher.Mode(rawValue: v) else { usage() }
+            settings.mode = m
+        case "--locality":
+            guard let v = it.next(), let w = Double(v), w >= 0 else { usage() }
+            settings.stripSeamLocality = w
+        case "--blend-levels":
+            guard let v = it.next(), let n = Int(v), n >= 1 else { usage() }
+            settings.stripBlendLevels = n
         default:
             if arg.hasPrefix("-") || folder != nil { usage() }
             folder = arg
@@ -283,7 +322,7 @@ func runPano(_ args: [String]) throws {
             url = base.appendingPathExtension("\(i + 1).\(outURL.pathExtension)")
         }
         try ImageLoader.writeImage(pano.image.makeCGImage(), to: url)
-        print("panorama: \(url.path)")
+        print("\(pano.kind.rawValue): \(url.path)")
     }
 }
 
@@ -300,6 +339,8 @@ do {
         try runRecognize(Array(arguments.dropFirst()))
     case "pano":
         try runPano(Array(arguments.dropFirst()))
+    case "strip":
+        try runPano(Array(arguments.dropFirst()), mode: .strip)
     case "help", "-h", "--help":
         usage(exitCode: 0)
     default:

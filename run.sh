@@ -4,6 +4,7 @@
 #   ./run.sh                  open the app
 #   ./run.sh <folder>         stitch that folder from the command line;
 #                             output lands next to it as <folder>.jpg
+#                             (panorama or strip, whichever fits the photos)
 #   ./run.sh <stitch args>    pass anything else straight to the stitch CLI,
 #                             e.g. ./run.sh pano shots -o pano.png --no-crop
 set -e
@@ -15,7 +16,7 @@ run.sh — build (incrementally) and run Stitch
 
   ./run.sh                  open the app
   ./run.sh <folder>         stitch that folder; output lands next to it
-                            as <folder>.jpg
+                            as <folder>.jpg (panorama or strip, auto)
   ./run.sh <stitch args>    pass anything else to the stitch CLI (below)
 
 EOF

@@ -19,6 +19,7 @@ final class StitchModel: ObservableObject {
         let preview: CGImage
         let info: String
         let suggestedName: String
+        let kindName: String
     }
 
     @Published var phase: Phase = .idle
@@ -26,6 +27,7 @@ final class StitchModel: ObservableObject {
     @Published var results: [PanoResult] = []
     /// nil = auto (Pannini under 160°, spherical above).
     @Published var projection: PanoProjection? = nil
+    @Published var mode: Stitcher.Mode = .auto
 
     func stitch(dropped: [URL]) {
         guard phase != .running else { return }
@@ -40,6 +42,7 @@ final class StitchModel: ObservableObject {
 
         var settings = Stitcher.Settings()
         settings.projection = projection
+        settings.mode = mode
         Task.detached(priority: .userInitiated) {
             do {
                 let panoramas = try Stitcher.stitch(urls: urls, settings: settings) { line in
@@ -50,19 +53,21 @@ final class StitchModel: ObservableObject {
                 let built = panoramas.enumerated().map { (i, pano) -> PanoResult in
                     let full = pano.image.makeCGImage()
                     let mp = Double(full.width * full.height) / 1_000_000
+                    let shape = pano.kind == .strip
+                        ? "strip" : "\(String(format: "%.0f", pano.horizontalDegrees))° span"
                     let info = "\(full.width) × \(full.height)  (\(String(format: "%.1f", mp)) MP, "
-                        + "\(String(format: "%.0f", pano.horizontalDegrees))° span, "
-                        + "\(pano.sourceURLs.count) photos)"
+                        + "\(shape), \(pano.sourceURLs.count) photos)"
                     let base = pano.sourceURLs.first?.deletingLastPathComponent().lastPathComponent ?? "panorama"
                     let name = panoramas.count > 1 ? "\(base)-\(i + 1)" : base
                     return PanoResult(full: full,
                                       preview: Self.thumbnail(of: full, maxWidth: 2000),
                                       info: info,
-                                      suggestedName: name)
+                                      suggestedName: name,
+                                      kindName: pano.kind == .strip ? "Strip" : "Panorama")
                 }
                 await MainActor.run {
                     self.results = built
-                    self.phase = built.isEmpty ? .failed("No panorama could be recognized in those images.") : .done
+                    self.phase = built.isEmpty ? .failed("No panorama or strip could be recognized in those images.") : .done
                 }
             } catch {
                 await MainActor.run {

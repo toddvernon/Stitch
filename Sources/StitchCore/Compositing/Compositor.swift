@@ -2,7 +2,8 @@ import Foundation
 
 /// Milestone-6 compositing pipeline: project layers, compensate gain, find
 /// graph-cut seams at working resolution, multi-band blend at full resolution,
-/// and crop to the largest fully-covered rectangle.
+/// and crop to the largest fully-covered rectangle. Generic over the output
+/// space via `LayerSource`, so panoramas and strips share it.
 public enum Compositor {
 
     public struct Options {
@@ -17,6 +18,10 @@ public enum Compositor {
         public var crop = true
         /// nil = auto: Pannini under 160° of span, spherical above.
         public var projection: PanoProjection? = nil
+        /// Seam data term favoring the image whose center is nearest each
+        /// pixel (see `SeamFinder`). 0 for panoramas; strips set it so each
+        /// region comes from the photo taken most directly in front of it.
+        public var seamLocalityWeight = 0.0
         public init() {}
     }
 
@@ -34,29 +39,37 @@ public enum Compositor {
     public struct Result {
         public var image: RGBImage
         public var gains: [Int: Double]
-        public var geometry: PanoGeometry
     }
 
+    /// Rotational panorama: builds the `PanoLayerSource` and composites.
     /// `imageProvider(index, maxDimension)` loads a source image, optionally
     /// downsampled; images are requested one at a time so full-resolution
     /// sources never need to be resident together.
     public static func compose(cameras: [Int: Camera],
                                meshes: [Int: WarpMesh],
                                options: Options = Options(),
-                               imageProvider: (Int, Int?) throws -> RGBImage) rethrows -> Result? {
+                               imageProvider: (Int, Int?) throws -> RGBImage) rethrows -> (Result, PanoGeometry)? {
         let projection = resolveProjection(options.projection, cameras: cameras)
-        guard let geoFull = PanoGeometry(cameras: cameras, outputWidth: options.outputWidth,
-                                         projection: projection) else { return nil }
-        let geoLow = geoFull.scaled(toWidth: min(options.seamWidth, options.outputWidth))
-        let indices = cameras.keys.sorted()
+        guard let source = PanoLayerSource(cameras: cameras, meshes: meshes,
+                                           outputWidth: options.outputWidth,
+                                           projection: projection) else { return nil }
+        guard let result = try compose(source: source, options: options,
+                                       imageProvider: imageProvider) else { return nil }
+        return (result, source.geometry)
+    }
+
+    /// The shared compositing pass over any `LayerSource`.
+    public static func compose<S: LayerSource>(source full: S,
+                                               options: Options = Options(),
+                                               imageProvider: (Int, Int?) throws -> RGBImage) rethrows -> Result? {
+        let low = full.scaled(toWidth: min(options.seamWidth, full.width))
+        let indices = full.imageIndices
 
         // Low-res layers for gain + seams.
         var lowLayers: [ImageLayer] = []
         for idx in indices {
             let img = try imageProvider(idx, options.seamSourceDimension)
-            guard let layer = LayerProjector.project(imageIndex: idx, camera: cameras[idx]!,
-                                                     image: img, mesh: meshes[idx],
-                                                     geometry: geoLow) else { continue }
+            guard let layer = low.project(imageIndex: idx, image: img) else { continue }
             lowLayers.append(layer)
         }
         guard !lowLayers.isEmpty else { return nil }
@@ -66,31 +79,26 @@ public enum Compositor {
             GainCompensator.apply(gain: gains[lowLayers[i].imageIndex] ?? 1, to: &lowLayers[i])
         }
 
-        let labels = SeamFinder.labels(layers: lowLayers, width: geoLow.width, height: geoLow.height)
+        let labels = SeamFinder.labels(layers: lowLayers, width: low.width, height: low.height,
+                                       localityWeight: options.seamLocalityWeight)
 
         // Full-res blend, one image at a time to bound memory.
-        let blender = MultiBandBlender(width: geoFull.width, height: geoFull.height,
+        let blender = MultiBandBlender(width: full.width, height: full.height,
                                        levels: options.blendLevels)
-        let sx = Double(geoLow.width) / Double(geoFull.width)
+        let sx = Double(low.width) / Double(full.width)
         for idx in indices {
-            // Load each source no larger than the output resolution demands:
-            // pano px/rad divided by the camera's px/rad, with sampling margin.
-            let cam = cameras[idx]!
-            let needed = Double(max(cam.width, cam.height)) * geoFull.scale / cam.focal * 1.2
-            let img = try imageProvider(idx, Int(needed.rounded(.up)))
-            guard var layer = LayerProjector.project(imageIndex: idx, camera: cameras[idx]!,
-                                                     image: img, mesh: meshes[idx],
-                                                     geometry: geoFull) else { continue }
+            let img = try imageProvider(idx, full.sourceDimension(for: idx))
+            guard var layer = full.project(imageIndex: idx, image: img) else { continue }
             GainCompensator.apply(gain: gains[idx] ?? 1, to: &layer)
 
             // Seam ownership for this layer, sampled from the low-res label map.
             var seam = ImageF(width: layer.width, height: layer.height)
             let k = Int32(idx)
             for row in 0..<layer.height {
-                let ly = min(geoLow.height - 1, max(0, Int((Double(layer.y0 + row) + 0.5) * sx)))
+                let ly = min(low.height - 1, max(0, Int((Double(layer.y0 + row) + 0.5) * sx)))
                 for col in 0..<layer.width {
-                    let lx = min(geoLow.width - 1, max(0, Int((Double(layer.x0 + col) + 0.5) * sx)))
-                    if labels[ly * geoLow.width + lx] == k {
+                    let lx = min(low.width - 1, max(0, Int((Double(layer.x0 + col) + 0.5) * sx)))
+                    if labels[ly * low.width + lx] == k {
                         seam.pixels[row * layer.width + col] = 1
                     }
                 }
@@ -102,11 +110,11 @@ public enum Compositor {
         var image = blender.finalize()
         if options.crop {
             let rect = largestCoveredRect(coverage: blender.coverage)
-            if rect.w > geoFull.width / 4, rect.h > geoFull.height / 4 {
+            if rect.w > full.width / 4, rect.h > full.height / 4 {
                 image = image.cropped(x0: rect.x, y0: rect.y, width: rect.w, height: rect.h)
             }
         }
-        return Result(image: image, gains: gains, geometry: geoFull)
+        return Result(image: image, gains: gains)
     }
 
     /// Largest axis-aligned rectangle containing only covered pixels

@@ -43,11 +43,19 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Text("Drop a folder of photos to stitch")
                 .font(.title2)
-            Text("Photos are matched automatically — no ordering needed.\nJunk shots are ignored; multiple panoramas are recognized separately.")
+            Text("Photos are matched automatically — no ordering needed.\nJunk shots are ignored; multiple panoramas are recognized separately.\nA walk along a row of houses becomes a strip instead of a panorama.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
             Button("Choose Photos…") { showImporter = true }
                 .keyboardShortcut("o")
+            Picker("Mode", selection: $model.mode) {
+                Text("Auto").tag(Stitcher.Mode.auto)
+                Text("Panorama").tag(Stitcher.Mode.panorama)
+                Text("Strip").tag(Stitcher.Mode.strip)
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 380)
+            .padding(.top, 8)
             Picker("Projection", selection: $model.projection) {
                 Text("Auto").tag(PanoProjection?.none)
                 Text("Pannini").tag(PanoProjection?.some(.pannini))
@@ -56,7 +64,7 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
             .frame(maxWidth: 380)
-            .padding(.top, 8)
+            .disabled(model.mode == .strip)
         }
         .padding(40)
     }
@@ -125,7 +133,7 @@ private struct TabViewOrSingle: View {
             TabView {
                 ForEach(Array(results.enumerated()), id: \.element.id) { i, result in
                     PanoramaPane(result: result)
-                        .tabItem { Text("Panorama \(i + 1)") }
+                        .tabItem { Text("\(result.kindName) \(i + 1)") }
                 }
             }
             .padding(8)

@@ -8,9 +8,19 @@ public enum SeamFinder {
 
     /// Returns a label map (geometry-sized, -1 where no image covers the pixel)
     /// built by sequential pairwise binary cuts, one new image at a time.
-    public static func labels(layers: [ImageLayer], width: Int, height: Int) -> [Int32] {
+    ///
+    /// `localityWeight` adds a per-pixel data term of weight × (1 − tent),
+    /// tent being each layer's center-peaked weight: it charges for using an
+    /// image far from its center. Where the smoothness cost is near zero
+    /// (sand, sky, blank walls) this decides the seam instead of leaving it
+    /// to chance; where there is texture the cut still follows the low-
+    /// difference path. For multi-viewpoint strips this is the preference
+    /// for the photo taken most directly in front of each region.
+    public static func labels(layers: [ImageLayer], width: Int, height: Int,
+                              localityWeight: Double = 0) -> [Int32] {
         var label = [Int32](repeating: -1, count: width * height)
         var compositeIntensity = [Float](repeating: 0, count: width * height)
+        var compositeTent = [Float](repeating: 0, count: width * height)
 
         func intensity(_ layer: ImageLayer, _ localIndex: Int) -> Float {
             (layer.rgb.r.pixels[localIndex] + layer.rgb.g.pixels[localIndex] + layer.rgb.b.pixels[localIndex]) / 3
@@ -30,6 +40,7 @@ public enum SeamFinder {
                     if label[pi] < 0 {
                         label[pi] = k
                         compositeIntensity[pi] = intensity(layer, li)
+                        compositeTent[pi] = layer.tent.pixels[li]
                     } else {
                         nodeOf[pi] = Int32(overlap.count)
                         overlap.append(pi)
@@ -38,12 +49,14 @@ public enum SeamFinder {
             }
             guard !overlap.isEmpty else { continue }
 
-            // New-image intensity over the overlap.
+            // New-image intensity and tent over the overlap.
             var newIntensity = [Float](repeating: 0, count: overlap.count)
+            var newTent = [Float](repeating: 0, count: overlap.count)
             for (node, pi) in overlap.enumerated() {
                 let py = pi / width, px = pi % width
                 let li = (py - layer.y0) * layer.width + (px - layer.x0)
                 newIntensity[node] = intensity(layer, li)
+                newTent[node] = layer.tent.pixels[li]
             }
 
             let flow = MaxFlow(nodeCount: overlap.count)
@@ -51,6 +64,14 @@ public enum SeamFinder {
             for (node, pi) in overlap.enumerated() {
                 let py = pi / width, px = pi % width
                 let diffHere = Double(abs(compositeIntensity[pi] - newIntensity[node]))
+
+                if localityWeight > 0 {
+                    // Source side keeps the composite, so the source edge is
+                    // what a switch to the new image cuts: its capacity is
+                    // the new image's locality cost, and vice versa.
+                    flow.addSourceEdge(node, cap: localityWeight * Double(1 - newTent[node]))
+                    flow.addSinkEdge(node, cap: localityWeight * Double(1 - compositeTent[pi]))
+                }
 
                 for (nx, ny) in [(px + 1, py), (px, py + 1), (px - 1, py), (px, py - 1)] {
                     guard nx >= 0, nx < width, ny >= 0, ny < height else { continue }
@@ -77,6 +98,7 @@ public enum SeamFinder {
             for (node, pi) in overlap.enumerated() where !flow.isSourceSide(node) {
                 label[pi] = k
                 compositeIntensity[pi] = newIntensity[node]
+                compositeTent[pi] = newTent[node]
             }
         }
         return label
