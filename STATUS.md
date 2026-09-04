@@ -1,6 +1,6 @@
 # STATUS
 
-Rolled at end of session, read by /sos. Current as of 2026-09-04 afternoon.
+Rolled at end of session, read by /sos. Current as of 2026-09-04, end of day.
 
 ## The session, in one breath
 
@@ -55,5 +55,6 @@ https://github.com/toddvernon/Stitch, private for now.
 
 ## Committed this session
 
-39e7d06 strip mode, d87d6da GPS hints, plus the /sos and /eos skills and
-this file. All on origin/main.
+39e7d06 strip mode, d87d6da GPS hints, 7a7e9d8 the /sos and /eos skills
+and this file, then this roll. All on origin/main, verified in sync at
+/eos with 39 tests green.
