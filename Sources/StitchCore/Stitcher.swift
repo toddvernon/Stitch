@@ -73,23 +73,38 @@ public enum Stitcher {
             }
             return (images, features)
         }
+        // Positions are advisory only: a log line, an explanation for photos
+        // that didn't connect, and a tiebreak. Missing GPS changes nothing.
+        let coords = GPSHints.coordinates(urls: urls)
+        if let line = GPSHints.summary(coords, totalPhotos: urls.count) { progress(line) }
+        let names = urls.map(\.lastPathComponent)
+
         let stripDimension = max(settings.registrationMaxDimension, settings.stripRegistrationMaxDimension)
         var (images, features) = try detect(maxDimension: settings.mode == .strip
                                             ? stripDimension : settings.registrationMaxDimension)
         var sizes = images.map { (width: $0.width, height: $0.height) }
 
         var (kind, groups) = recognize(features: features, sizes: sizes, mode: settings.mode,
-                                       progress: progress)
+                                       gpsSpread: GPSHints.spread(coords), progress: progress)
         if kind == .strip, settings.mode == .auto, stripDimension > settings.registrationMaxDimension {
             // Auto chose a strip on panorama-resolution features; redo
             // detection at strip resolution, which places more images.
             progress("re-detecting at \(stripDimension) px for the strip…")
             (images, features) = try detect(maxDimension: stripDimension)
             sizes = images.map { (width: $0.width, height: $0.height) }
-            (kind, groups) = recognize(features: features, sizes: sizes, mode: .strip, progress: progress)
+            (kind, groups) = recognize(features: features, sizes: sizes, mode: .strip,
+                                       gpsSpread: nil, progress: progress)
+        }
+        let placed = Set(groups.flatMap(\.imageIndices))
+        let unplaced = (0..<urls.count).filter { !placed.contains($0) }
+        if !unplaced.isEmpty, !groups.isEmpty {
+            progress("unmatched: \(unplaced.map { names[$0] }.joined(separator: ", "))")
+        }
+        for note in GPSHints.gapNotes(unplaced: unplaced, coords: coords, names: names) {
+            progress(note)
         }
         guard !groups.isEmpty else {
-            progress("no \(settings.mode == .strip ? "strips" : "panoramas") recognized")
+            progress("no \(kind == .strip ? "strips" : "panoramas") recognized")
             return []
         }
         let noun = kind == .strip ? "strip" : "panorama"
@@ -115,9 +130,11 @@ public enum Stitcher {
     /// Runs recognition per the mode. Auto tries both models and keeps the
     /// one whose largest group holds more images: a rotational set verifies
     /// as a panorama easily and a walked set never does, so the choice is
-    /// rarely close.
+    /// rarely close. A tie falls to the panorama unless GPS says the
+    /// photographer moved (`gpsSpread` beyond `GPSHints.movedThreshold`).
     static func recognize(features: [[Feature]], sizes: [(width: Int, height: Int)],
-                          mode: Mode, progress: (String) -> Void) -> (Kind, [PanoramaGroup]) {
+                          mode: Mode, gpsSpread: Double? = nil,
+                          progress: (String) -> Void) -> (Kind, [PanoramaGroup]) {
         switch mode {
         case .panorama:
             return (.panorama, PanoramaRecognizer.recognize(features: features, imageSizes: sizes))
@@ -132,6 +149,10 @@ public enum Stitcher {
             let stripBest = strip.first?.imageIndices.count ?? 0
             if stripBest > panoBest {
                 progress("auto: strip (\(stripBest) images placed vs \(panoBest) as a panorama)")
+                return (.strip, strip)
+            }
+            if stripBest == panoBest, let spread = gpsSpread, spread >= GPSHints.movedThreshold {
+                progress("auto: strip (tie at \(stripBest) images; GPS says the photos span \(Int(spread.rounded())) m)")
                 return (.strip, strip)
             }
             return (.panorama, pano)

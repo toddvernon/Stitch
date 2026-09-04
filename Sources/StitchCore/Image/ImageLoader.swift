@@ -80,6 +80,22 @@ public enum ImageLoader {
         return exif[kCGImagePropertyExifFocalLenIn35mmFilm] as? Double
     }
 
+    /// EXIF GPS position if present. Never required: it only feeds
+    /// diagnostics and the auto-mode tiebreak (see `GPSHints`).
+    public static func gpsCoordinate(url: URL) -> GPSCoordinate? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let gps = props[kCGImagePropertyGPSDictionary] as? [CFString: Any],
+              let lat = gps[kCGImagePropertyGPSLatitude] as? Double,
+              let lon = gps[kCGImagePropertyGPSLongitude] as? Double else {
+            return nil
+        }
+        let latRef = gps[kCGImagePropertyGPSLatitudeRef] as? String ?? "N"
+        let lonRef = gps[kCGImagePropertyGPSLongitudeRef] as? String ?? "E"
+        return GPSCoordinate(latitude: latRef == "S" ? -lat : lat,
+                             longitude: lonRef == "W" ? -lon : lon)
+    }
+
     public static func writePNG(_ cgImage: CGImage, to url: URL) throws {
         try writeImage(cgImage, to: url)
     }

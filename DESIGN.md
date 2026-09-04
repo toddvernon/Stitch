@@ -232,6 +232,18 @@ whichever places more images):
    remains over hundreds of pixels. With 5 levels a vertical band showed in
    the sky.
 
+**GPS is advisory, never required.** Phone positions are good to a few
+meters in the open: enough to say whether the photographer moved and how
+far between shots, useless for alignment (5 m of error on a 20 m step is a
+25% scale uncertainty; the image content places things to ~5 px). So
+`GPSHints` reads EXIF positions when present and uses them for exactly
+three things: a log line (span and typical step, or "shot from one spot"),
+an explanation for photos that didn't connect (BeachWalk's last frame sits
+60 m from its nearest neighbor, 2.2× the typical step — a dropped frame),
+and the auto-mode tiebreak when both models place the same number of
+images. Photos without positions change nothing; positions never enter
+the geometry.
+
 Known intrinsic limits (not engineering gaps): content far off the dominant
 plane duplicates, truncates, or stretches (near foreground is the
 troublemaker; distant background is easy); a curved walking path bends the

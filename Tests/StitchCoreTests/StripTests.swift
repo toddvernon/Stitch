@@ -208,3 +208,51 @@ final class StripTests: XCTestCase {
         }
     }
 }
+
+final class GPSHintsTests: XCTestCase {
+
+    // Along a beach: ~25 m steps eastward, one dropped frame before the last.
+    private let walk: [Int: GPSCoordinate] = [
+        0: GPSCoordinate(latitude: 32.1150, longitude: -80.80300),
+        1: GPSCoordinate(latitude: 32.1150, longitude: -80.80327),
+        2: GPSCoordinate(latitude: 32.1150, longitude: -80.80354),
+        3: GPSCoordinate(latitude: 32.1150, longitude: -80.80381),
+        4: GPSCoordinate(latitude: 32.1150, longitude: -80.80462),
+    ]
+
+    func testDistanceMatchesKnownScale() {
+        // One degree of longitude at this latitude is ~94.3 km.
+        let a = GPSCoordinate(latitude: 32.115, longitude: -80.8)
+        let b = GPSCoordinate(latitude: 32.115, longitude: -80.801)
+        XCTAssertEqual(a.distance(to: b), 94.3, accuracy: 0.5)
+        XCTAssertEqual(a.distance(to: a), 0)
+    }
+
+    func testSpreadStepAndGaps() {
+        XCTAssertEqual(GPSHints.spread(walk)!, 153, accuracy: 2)
+        XCTAssertEqual(GPSHints.typicalStep(walk)!, 25.5, accuracy: 1)
+        let notes = GPSHints.gapNotes(unplaced: [4], coords: walk, names: (0...4).map { "IMG_\($0)" })
+        XCTAssertEqual(notes.count, 1)
+        XCTAssertTrue(notes[0].hasPrefix("IMG_4: 76 m from the nearest photo, 3.0×"))
+        // A photo at a normal step earns no note even if it went unplaced.
+        XCTAssertTrue(GPSHints.gapNotes(unplaced: [2], coords: walk, names: (0...4).map { "IMG_\($0)" }).isEmpty)
+        XCTAssertTrue(GPSHints.summary(walk, totalPhotos: 6)!.hasPrefix("GPS: photos span 153 m, typical step 25 m (5 of 6 photos positioned)"))
+    }
+
+    func testEverythingIsNilOrEmptyWithoutPositions() {
+        let none: [Int: GPSCoordinate] = [:]
+        XCTAssertNil(GPSHints.spread(none))
+        XCTAssertNil(GPSHints.typicalStep(none))
+        XCTAssertNil(GPSHints.summary(none, totalPhotos: 4))
+        XCTAssertTrue(GPSHints.gapNotes(unplaced: [0, 1], coords: none, names: ["a", "b"]).isEmpty)
+        let one = [0: walk[0]!]
+        XCTAssertNil(GPSHints.spread(one))
+        XCTAssertNil(GPSHints.summary(one, totalPhotos: 4))
+    }
+
+    func testStandingStillReadsAsOneSpot() {
+        let spot = [0: walk[0]!, 1: GPSCoordinate(latitude: 32.11503, longitude: -80.80302)]
+        XCTAssertTrue(GPSHints.summary(spot, totalPhotos: 2)!.contains("shot from one spot"))
+        XCTAssertLessThan(GPSHints.spread(spot)!, GPSHints.movedThreshold)
+    }
+}
