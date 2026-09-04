@@ -153,6 +153,55 @@ an optional non-core module.
 All milestones complete. Open items: radial distortion in bundle adjustment,
 memory streaming in the blender, golden-image CI tests, app icon.
 
+## Future: `stitch strip` — multi-viewpoint linear panoramas
+
+The walk-down-the-beach case: photograph each house from in front of it,
+moving between shots, and produce one very long image of the whole row.
+This is fundamentally outside the rotational model — each photo has its own
+center of projection, so no single-viewpoint output exists. The solved
+approach (Agarwala et al., SIGGRAPH 2006) embraces that: build a
+**multi-viewpoint** mosaic where each region of the output is drawn from the
+photo taken most directly in front of it, in the spirit of a pushbroom /
+slit-scan camera.
+
+Sketch of a Stitch implementation, as a distinct mode beside `pano`:
+
+1. Pairwise matching as today; RANSAC naturally locks onto the dominant
+   plane (the facades), giving planar homographies per adjacent pair.
+2. Instead of rotational bundle adjustment, chain the pairwise homographies
+   with a gauge that keeps verticals vertical and scale consistent
+   (full structure-from-motion, as in the paper, improves strip placement
+   but is not required for a first version).
+3. Render onto the dominant plane rather than the sphere.
+4. The existing graph-cut seam finder + multi-band blender then perform the
+   multi-viewpoint selection — in the 2006 paper the per-pixel choice of
+   source photo *is* the heart of the method, and our seam machinery is the
+   same mechanism with a viewpoint-locality preference added to the data term.
+
+Known intrinsic limits (not engineering gaps): content far off the dominant
+plane duplicates, truncates, or stretches (near foreground is the
+troublemaker; distant background is easy); a curved walking path bends the
+output; moving subjects rely on seams routing around them. Shooting guidance:
+~50% overlap, camera held square to the facade line.
+
+References:
+
+- A. Agarwala, M. Agrawala, M. Cohen, D. Salesin, R. Szeliski.
+  *Photographing Long Scenes with Multi-Viewpoint Panoramas.* SIGGRAPH 2006.
+  (The canonical solution to exactly this use case.)
+- J. Kopf, B. Chen, R. Szeliski, M. Cohen. *Street Slide: Browsing Street
+  Level Imagery.* SIGGRAPH 2010. (Interactive strip panoramas of facades.)
+- J. Y. Zheng. *Digital Route Panoramas.* IEEE MultiMedia, 2003.
+  (Strip mosaics from continuous drive-by video.)
+- A. Rav-Acha, G. Engel, S. Peleg. *Minimal Aspect Distortion (MAD)
+  Mosaicing of Long Scenes.* IJCV 2008. (Reducing aspect distortion when
+  scene depth varies.)
+- A. Román, H. P. A. Lensch. *Automatic Multiperspective Images.* EGSR 2006.
+  (Automated multi-perspective strip construction from video.)
+- A. Zomet, D. Feldman, S. Peleg, D. Weinshall. *Mosaicing New Views: The
+  Crossed-Slits Projection.* IEEE TPAMI 2003. (The projection theory
+  underlying pushbroom/slit mosaics.)
+
 ## References
 
 - M. Brown, D. Lowe. *Automatic Panoramic Image Stitching using Invariant
