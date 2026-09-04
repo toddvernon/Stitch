@@ -15,7 +15,20 @@ public enum Compositor {
         public var seamSourceDimension = 800
         public var blendLevels = 5
         public var crop = true
+        /// nil = auto: Pannini under 160° of span, spherical above.
+        public var projection: PanoProjection? = nil
         public init() {}
+    }
+
+    /// The auto rule: Pannini flatters wide architecture but degrades past
+    /// ~150-160°; spherical is correct at any span.
+    public static func resolveProjection(_ choice: PanoProjection?,
+                                         cameras: [Int: Camera]) -> PanoProjection {
+        if let choice { return choice }
+        guard let probe = PanoGeometry(cameras: cameras, outputWidth: 1000,
+                                       projection: .spherical) else { return .spherical }
+        let spanDegrees = (probe.thetaMax - probe.thetaMin) * 180 / .pi
+        return spanDegrees < 160 ? .pannini : .spherical
     }
 
     public struct Result {
@@ -31,7 +44,9 @@ public enum Compositor {
                                meshes: [Int: WarpMesh],
                                options: Options = Options(),
                                imageProvider: (Int, Int?) throws -> RGBImage) rethrows -> Result? {
-        guard let geoFull = PanoGeometry(cameras: cameras, outputWidth: options.outputWidth) else { return nil }
+        let projection = resolveProjection(options.projection, cameras: cameras)
+        guard let geoFull = PanoGeometry(cameras: cameras, outputWidth: options.outputWidth,
+                                         projection: projection) else { return nil }
         let geoLow = geoFull.scaled(toWidth: min(options.seamWidth, options.outputWidth))
         let indices = cameras.keys.sorted()
 

@@ -20,7 +20,10 @@ func usage() -> Never {
           panoramas (connected components of verified pairs).
 
       pano <folder> -o <out.png|jpg|tiff> [--max-dim <N>] [--width <W>]
-                    [--no-mesh] [--no-crop]
+                    [--no-mesh] [--no-crop] [--projection <p>]
+          --projection: spherical, cylindrical, pannini, or auto (default:
+          pannini under 160° of span for a natural perspective look,
+          spherical above).
           Full pipeline: recognize, bundle adjust, straighten, refine parallax
           with warp meshes (skip with --no-mesh), then composite with gain
           compensation, graph-cut seams, and multi-band blending, cropped to
@@ -249,6 +252,15 @@ func runPano(_ args: [String]) throws {
             settings.useMesh = false
         case "--no-crop":
             settings.crop = false
+        case "--projection":
+            guard let v = it.next() else { usage() }
+            if v == "auto" {
+                settings.projection = nil
+            } else if let p = PanoProjection(rawValue: v) {
+                settings.projection = p
+            } else {
+                usage()
+            }
         default:
             if arg.hasPrefix("-") || folder != nil { usage() }
             folder = arg

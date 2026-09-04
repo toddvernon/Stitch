@@ -153,6 +153,31 @@ an optional non-core module.
 All milestones complete. Open items: radial distortion in bundle adjustment,
 memory streaming in the blender, golden-image CI tests, app icon.
 
+## Output projections
+
+A projection that keeps all straight lines straight (rectilinear) is
+mathematically unusable past ~120° of span, so every wide panorama chooses
+what to sacrifice. Stitch renders through a pluggable projection in
+`PanoGeometry` (the single place pano pixels map to ray directions — the seam
+finder, blender, and crop all work in pano space and are projection-agnostic):
+
+- **Spherical** (equirectangular): verticals straight, horizontals curve.
+  Correct at any span; the only choice approaching 360°.
+- **Cylindrical**: verticals and the horizon straight, other horizontals
+  curve; vertical extent stretched by tan(φ).
+- **Pannini** (d = 1): verticals straight, radial lines through the center
+  straight; renders wide architecture with a convincing perspective feel out
+  to ~150°. u = (d+1)·sinθ / (d+cosθ), v = (d+1)·tanφ / (d+cosθ). The
+  default for spans under 160° (auto mode); spherical above.
+
+References:
+
+- T. Sharpless, B. Postle, D. German. *Pannini: A New Projection for
+  Rendering Wide Angle Perspective Images.* Computational Aesthetics 2010.
+- R. Carroll, M. Agrawala, A. Agarwala. *Optimizing Content-Preserving
+  Projections for Wide-Angle Images.* SIGGRAPH 2009. (The locally-adaptive
+  mesh approach; noted as a possible future upgrade, not implemented.)
+
 ## Future: `stitch strip` — multi-viewpoint linear panoramas
 
 The walk-down-the-beach case: photograph each house from in front of it,

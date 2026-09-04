@@ -24,6 +24,8 @@ final class StitchModel: ObservableObject {
     @Published var phase: Phase = .idle
     @Published var log: [String] = []
     @Published var results: [PanoResult] = []
+    /// nil = auto (Pannini under 160°, spherical above).
+    @Published var projection: PanoProjection? = nil
 
     func stitch(dropped: [URL]) {
         guard phase != .running else { return }
@@ -36,9 +38,11 @@ final class StitchModel: ObservableObject {
         log = ["stitching \(urls.count) images…"]
         results = []
 
+        var settings = Stitcher.Settings()
+        settings.projection = projection
         Task.detached(priority: .userInitiated) {
             do {
-                let panoramas = try Stitcher.stitch(urls: urls) { line in
+                let panoramas = try Stitcher.stitch(urls: urls, settings: settings) { line in
                     Task { @MainActor in
                         self.log.append(line)
                     }

@@ -21,6 +21,8 @@ public enum Stitcher {
         public var maxOutputWidth = 12000
         public var useMesh = true
         public var crop = true
+        /// nil = auto: Pannini under 160° of span, spherical above.
+        public var projection: PanoProjection? = nil
         public init() {}
     }
 
@@ -74,9 +76,14 @@ public enum Stitcher {
                 progress("\(tag)parallax residual \(String(format: "%.2f", refined.initialRMS)) → \(String(format: "%.2f", refined.finalRMS)) px")
             }
 
+            let projection = Compositor.resolveProjection(settings.projection,
+                                                          cameras: alignment.cameras)
+            progress("\(tag)projection: \(projection.rawValue)")
+
             var width = settings.outputWidth
             if width == 0 {
-                width = min(naturalWidth(cameras: alignment.cameras, urls: urls),
+                width = min(naturalWidth(cameras: alignment.cameras, urls: urls,
+                                         projection: projection),
                             settings.maxOutputWidth)
                 progress("\(tag)output width \(width) px")
             }
@@ -84,6 +91,7 @@ public enum Stitcher {
             var options = Compositor.Options()
             options.outputWidth = width
             options.crop = settings.crop
+            options.projection = projection
             progress("\(tag)compositing…")
             guard let composed = try Compositor.compose(cameras: alignment.cameras,
                                                         meshes: meshes,
@@ -104,9 +112,12 @@ public enum Stitcher {
         return results
     }
 
-    /// Angular span × mean focal at the sources' native resolution.
-    static func naturalWidth(cameras: [Int: Camera], urls: [URL]) -> Int {
-        guard let probe = PanoGeometry(cameras: cameras, outputWidth: 1000) else { return 4000 }
+    /// Projection span × mean focal at the sources' native resolution
+    /// (u ≈ θ at the pano center, so this keeps center resolution ≈ source).
+    static func naturalWidth(cameras: [Int: Camera], urls: [URL],
+                             projection: PanoProjection = .spherical) -> Int {
+        guard let probe = PanoGeometry(cameras: cameras, outputWidth: 1000,
+                                       projection: projection) else { return 4000 }
         var scaled: [Double] = []
         for (idx, cam) in cameras {
             guard idx < urls.count, let dims = ImageLoader.pixelDimensions(url: urls[idx]) else { continue }
@@ -116,7 +127,7 @@ public enum Stitcher {
         }
         guard !scaled.isEmpty else { return 4000 }
         let fMean = scaled.reduce(0, +) / Double(scaled.count)
-        return max(1000, Int((probe.thetaMax - probe.thetaMin) * fMean))
+        return max(1000, Int(probe.uSpan * fMean))
     }
 
     /// Image files in a folder (or the URLs themselves if already files),

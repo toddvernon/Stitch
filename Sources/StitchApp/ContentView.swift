@@ -48,6 +48,15 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Button("Choose Photos…") { showImporter = true }
                 .keyboardShortcut("o")
+            Picker("Projection", selection: $model.projection) {
+                Text("Auto").tag(PanoProjection?.none)
+                Text("Pannini").tag(PanoProjection?.some(.pannini))
+                Text("Cylindrical").tag(PanoProjection?.some(.cylindrical))
+                Text("Spherical").tag(PanoProjection?.some(.spherical))
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 380)
+            .padding(.top, 8)
         }
         .padding(40)
     }

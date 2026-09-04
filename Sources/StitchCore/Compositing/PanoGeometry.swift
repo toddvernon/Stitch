@@ -1,21 +1,83 @@
 import Foundation
 import simd
 
-/// The shared spherical output space: angular extent of the panorama and the
-/// mapping between pano pixels and world ray directions.
+/// How pano coordinates relate to viewing angles (see DESIGN.md, "Output
+/// projections"). All keep verticals straight; they differ in what else
+/// survives a wide span.
+public enum PanoProjection: String, CaseIterable, Sendable {
+    /// Equirectangular: u = θ, v = φ. Correct at any span.
+    case spherical
+    /// u = θ, v = tanφ: the horizon straightens, vertical extent stretches.
+    case cylindrical
+    /// Sharpless/Postle/German 2010, d = 1: verticals and radial lines
+    /// straight; natural-looking architecture out to ~150°.
+    case pannini
+
+    static let panniniD = 1.0
+
+    /// (θ, φ) → projection coordinates (u, v).
+    func forward(theta: Double, phi: Double) -> SIMD2<Double> {
+        switch self {
+        case .spherical:
+            return SIMD2(theta, phi)
+        case .cylindrical:
+            return SIMD2(theta, tan(min(max(phi, -1.4), 1.4)))
+        case .pannini:
+            let d = Self.panniniD
+            let den = max(d + cos(theta), 0.2)
+            return SIMD2((d + 1) * sin(theta) / den,
+                         (d + 1) * tan(min(max(phi, -1.4), 1.4)) / den)
+        }
+    }
+
+    /// (u, v) → (θ, φ).
+    func inverse(u: Double, v: Double) -> (theta: Double, phi: Double) {
+        switch self {
+        case .spherical:
+            return (u, v)
+        case .cylindrical:
+            return (u, atan(v))
+        case .pannini:
+            // Solve (d+1)·sinθ − u·cosθ = u·d  via  a·sinθ + b·cosθ = R·sin(θ+ψ).
+            let d = Self.panniniD
+            let s = d + 1
+            let r = sqrt(s * s + u * u)
+            let psi = atan2(-u, s)
+            let theta = asin(min(max(u * d / r, -1), 1)) - psi
+            let phi = atan(v * (d + cos(theta)) / (d + 1))
+            return (theta, phi)
+        }
+    }
+}
+
+/// The shared output space: the panorama's angular extent, its projection,
+/// and the mapping between pano pixels and world ray directions.
 public struct PanoGeometry {
+    public let projection: PanoProjection
+    /// Angular extent (for reporting; pixel mapping uses u/v below).
     public let thetaMin: Double
     public let thetaMax: Double
     public let phiMin: Double
     public let phiMax: Double
-    /// Pixels per radian.
+    /// Projection-coordinate extent.
+    let uMin: Double
+    let uMax: Double
+    let vMin: Double
+    let vMax: Double
+    /// Pixels per projection unit (≈ pixels per radian at the pano center).
     public let scale: Double
     public let width: Int
     public let height: Int
 
-    public init?(cameras: [Int: Camera], outputWidth: Int) {
+    /// Horizontal span in projection units (u), for natural-width sizing.
+    public var uSpan: Double { uMax - uMin }
+
+    public init?(cameras: [Int: Camera], outputWidth: Int,
+                 projection: PanoProjection = .spherical) {
         var tMin = Double.infinity, tMax = -Double.infinity
         var pMin = Double.infinity, pMax = -Double.infinity
+        var uLo = Double.infinity, uHi = -Double.infinity
+        var vLo = Double.infinity, vHi = -Double.infinity
         for (_, cam) in cameras {
             let w = Double(cam.width), h = Double(cam.height)
             let steps = 16
@@ -23,44 +85,60 @@ public struct PanoGeometry {
                 let t = Double(k) / Double(steps)
                 for p in [SIMD2(t * w, 0), SIMD2(t * w, h), SIMD2(0, t * h), SIMD2(w, t * h)] {
                     let d = cam.ray(cam.centered(p))
-                    tMin = min(tMin, atan2(d.x, d.z))
-                    tMax = max(tMax, atan2(d.x, d.z))
+                    let theta = atan2(d.x, d.z)
                     let phi = asin(max(-1, min(1, -d.y)))
+                    tMin = min(tMin, theta)
+                    tMax = max(tMax, theta)
                     pMin = min(pMin, phi)
                     pMax = max(pMax, phi)
+                    let uv = projection.forward(theta: theta, phi: phi)
+                    uLo = min(uLo, uv.x)
+                    uHi = max(uHi, uv.x)
+                    vLo = min(vLo, uv.y)
+                    vHi = max(vHi, uv.y)
                 }
             }
         }
-        guard tMax > tMin, pMax > pMin else { return nil }
+        guard uHi > uLo, vHi > vLo else { return nil }
+        self.projection = projection
         thetaMin = tMin
         thetaMax = tMax
         phiMin = pMin
         phiMax = pMax
-        scale = Double(outputWidth) / (tMax - tMin)
+        uMin = uLo
+        uMax = uHi
+        vMin = vLo
+        vMax = vHi
+        scale = Double(outputWidth) / (uHi - uLo)
         width = outputWidth
-        height = max(1, Int((pMax - pMin) * scale))
+        height = max(1, Int((vHi - vLo) * scale))
     }
 
-    private init(thetaMin: Double, thetaMax: Double, phiMin: Double, phiMax: Double, outputWidth: Int) {
-        self.thetaMin = thetaMin
-        self.thetaMax = thetaMax
-        self.phiMin = phiMin
-        self.phiMax = phiMax
-        scale = Double(outputWidth) / (thetaMax - thetaMin)
+    private init(copying g: PanoGeometry, outputWidth: Int) {
+        projection = g.projection
+        thetaMin = g.thetaMin
+        thetaMax = g.thetaMax
+        phiMin = g.phiMin
+        phiMax = g.phiMax
+        uMin = g.uMin
+        uMax = g.uMax
+        vMin = g.vMin
+        vMax = g.vMax
+        scale = Double(outputWidth) / (g.uMax - g.uMin)
         width = outputWidth
-        height = max(1, Int((phiMax - phiMin) * scale))
+        height = max(1, Int((g.vMax - g.vMin) * scale))
     }
 
-    /// Same angular extent at a different output resolution.
+    /// Same extent and projection at a different output resolution.
     public func scaled(toWidth newWidth: Int) -> PanoGeometry {
-        PanoGeometry(thetaMin: thetaMin, thetaMax: thetaMax,
-                     phiMin: phiMin, phiMax: phiMax, outputWidth: newWidth)
+        PanoGeometry(copying: self, outputWidth: newWidth)
     }
 
     /// World ray direction for a pano pixel (pixel centers at +0.5).
     public func direction(px: Double, py: Double) -> SIMD3<Double> {
-        let theta = thetaMin + (px + 0.5) / scale
-        let phi = phiMax - (py + 0.5) / scale
+        let u = uMin + (px + 0.5) / scale
+        let v = vMax - (py + 0.5) / scale
+        let (theta, phi) = projection.inverse(u: u, v: v)
         let cosPhi = cos(phi)
         return SIMD3(sin(theta) * cosPhi, -sin(phi), cos(theta) * cosPhi)
     }
@@ -69,7 +147,8 @@ public struct PanoGeometry {
     public func panoPoint(direction d: SIMD3<Double>) -> SIMD2<Double> {
         let theta = atan2(d.x, d.z)
         let phi = asin(max(-1, min(1, -d.y)))
-        return SIMD2((theta - thetaMin) * scale - 0.5, (phiMax - phi) * scale - 0.5)
+        let uv = projection.forward(theta: theta, phi: phi)
+        return SIMD2((uv.x - uMin) * scale - 0.5, (vMax - uv.y) * scale - 0.5)
     }
 }
 
