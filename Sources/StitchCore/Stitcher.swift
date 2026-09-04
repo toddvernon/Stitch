@@ -145,6 +145,8 @@ public enum Stitcher {
                 files.append(url)
             }
         }
-        return files.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return files
+            .filter { !ImageLoader.isStitchOutput(url: $0) }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 }

@@ -163,19 +163,10 @@ func runMatch(_ args: [String]) throws {
     }
 }
 
-func imageURLs(in folder: String) throws -> [URL] {
-    let extensions = Set(["jpg", "jpeg", "png", "heic", "tif", "tiff"])
-    let contents = try FileManager.default.contentsOfDirectory(
-        at: URL(fileURLWithPath: folder), includingPropertiesForKeys: nil)
-    return contents
-        .filter { extensions.contains($0.pathExtension.lowercased()) }
-        .sorted { $0.lastPathComponent < $1.lastPathComponent }
-}
-
 /// Shared front half of recognize/pano: load, detect, recognize.
 func recognizePanoramas(folder: String, maxDim: Int) throws
     -> (urls: [URL], images: [ImageF], features: [[Feature]], groups: [PanoramaGroup]) {
-    let urls = try imageURLs(in: folder)
+    let urls = Stitcher.imageURLs(from: [URL(fileURLWithPath: folder)])
     guard urls.count >= 2 else {
         print("need at least 2 images in \(folder)")
         exit(1)

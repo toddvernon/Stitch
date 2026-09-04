@@ -96,7 +96,13 @@ public enum ImageLoader {
         guard let dest = CGImageDestinationCreateWithURL(url as CFURL, type.identifier as CFString, 1, nil) else {
             throw ImageLoaderError.cannotWrite(url)
         }
-        var props: [CFString: Any] = [:]
+        var props: [CFString: Any] = [
+            // Mark our own outputs so the pipeline never ingests a finished
+            // panorama that was saved into a source folder. JPEG stores this
+            // as XMP CreatorTool, PNG in its own Software field, TIFF as-is.
+            kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFSoftware: softwareTag],
+            kCGImagePropertyPNGDictionary: [kCGImagePropertyPNGSoftware: softwareTag],
+        ]
         if type == .jpeg {
             props[kCGImageDestinationLossyCompressionQuality] = jpegQuality
         }
@@ -104,5 +110,30 @@ public enum ImageLoader {
         guard CGImageDestinationFinalize(dest) else {
             throw ImageLoaderError.cannotWrite(url)
         }
+    }
+
+    static let softwareTag = "Stitch"
+
+    /// True if the file carries Stitch's own output marker, wherever the
+    /// format stored it (TIFF Software, PNG Software, or JPEG XMP CreatorTool).
+    public static func isStitchOutput(url: URL) -> Bool {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return false }
+        if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
+            if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any],
+               tiff[kCGImagePropertyTIFFSoftware] as? String == softwareTag {
+                return true
+            }
+            if let png = props[kCGImagePropertyPNGDictionary] as? [CFString: Any],
+               png[kCGImagePropertyPNGSoftware] as? String == softwareTag {
+                return true
+            }
+        }
+        if let meta = CGImageSourceCopyMetadataAtIndex(source, 0, nil),
+           let tag = CGImageMetadataCopyTagMatchingImageProperty(
+               meta, kCGImagePropertyTIFFDictionary, kCGImagePropertyTIFFSoftware),
+           CGImageMetadataTagCopyValue(tag) as? String == softwareTag {
+            return true
+        }
+        return false
     }
 }
