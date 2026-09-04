@@ -1,7 +1,7 @@
 import Foundation
 import StitchCore
 
-func usage() -> Never {
+func usage(exitCode: Int32 = 64) -> Never {
     print("""
     usage: stitch <command> [options]
 
@@ -37,7 +37,7 @@ func usage() -> Never {
       --double         double the image before detection (more features, 4x slower)
       --debug-out <p>  write keypoint overlay PNG to <p>
     """)
-    exit(64)
+    exit(exitCode)
 }
 
 func runFeatures(_ args: [String]) throws {
@@ -300,6 +300,8 @@ do {
         try runRecognize(Array(arguments.dropFirst()))
     case "pano":
         try runPano(Array(arguments.dropFirst()))
+    case "help", "-h", "--help":
+        usage(exitCode: 0)
     default:
         usage()
     }
