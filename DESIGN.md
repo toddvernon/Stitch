@@ -148,7 +148,10 @@ an optional non-core module.
 4. **Bundle adjustment + straightening**, crude linear-blend render to verify alignment. ✓
 5. **Mesh refinement** (the railing fix). ✓
 6. **Gain + graph-cut seams + multi-band blending** — full-quality output. ✓
-7. **SwiftUI app**. ← *current*
+7. **SwiftUI app**. ✓
+
+All milestones complete. Open items: radial distortion in bundle adjustment,
+memory streaming in the blender, golden-image CI tests, app icon.
 
 ## References
 

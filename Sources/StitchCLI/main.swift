@@ -19,15 +19,15 @@ func usage() -> Never {
           Detect features in every image in a folder and report the recognized
           panoramas (connected components of verified pairs).
 
-      pano <folder> -o <out.png> [--max-dim <N>] [--width <W>] [--no-mesh]
-                    [--no-crop] [--linear]
+      pano <folder> -o <out.png|jpg|tiff> [--max-dim <N>] [--width <W>]
+                    [--no-mesh] [--no-crop]
           Full pipeline: recognize, bundle adjust, straighten, refine parallax
           with warp meshes (skip with --no-mesh), then composite with gain
           compensation, graph-cut seams, and multi-band blending, cropped to
           the largest covered rectangle (--no-crop keeps the full sphere
-          projection; --linear uses the simple linear-blend preview renderer).
-          Output width defaults to the panorama's natural full resolution
-          (capped at 12000 px); override with --width.
+          projection). Every recognized panorama is written (extras suffixed
+          .2, .3, …). Output width defaults to the panorama's natural full
+          resolution (capped at 12000 px); override with --width.
 
     options:
       --max-dim <N>    downsample so the longer side is at most N pixels (default 2000)
@@ -232,11 +232,7 @@ func runRecognize(_ args: [String]) throws {
 func runPano(_ args: [String]) throws {
     var folder: String?
     var outPath: String?
-    var maxDim = 2000
-    var outputWidth = 0  // 0 = auto (natural full resolution, capped)
-    var useMesh = true
-    var crop = true
-    var linearBlend = false
+    var settings = Stitcher.Settings()
     var it = args.makeIterator()
     while let arg = it.next() {
         switch arg {
@@ -245,16 +241,14 @@ func runPano(_ args: [String]) throws {
             outPath = v
         case "--max-dim":
             guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
-            maxDim = n
+            settings.registrationMaxDimension = n
         case "--width":
             guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
-            outputWidth = n
+            settings.outputWidth = n
         case "--no-mesh":
-            useMesh = false
+            settings.useMesh = false
         case "--no-crop":
-            crop = false
-        case "--linear":
-            linearBlend = true
+            settings.crop = false
         default:
             if arg.hasPrefix("-") || folder != nil { usage() }
             folder = arg
@@ -262,109 +256,32 @@ func runPano(_ args: [String]) throws {
     }
     guard let folder, let outPath else { usage() }
 
-    let (urls, images, features, groups) = try recognizePanoramas(folder: folder, maxDim: maxDim)
-    guard let group = groups.first else {
-        print("no panorama recognized")
+    let urls = Stitcher.imageURLs(from: [URL(fileURLWithPath: folder)])
+    guard urls.count >= 2 else {
+        print("need at least 2 images in \(folder)")
         exit(1)
     }
-    print("largest panorama: \(group.imageIndices.count) of \(urls.count) images")
-
-    // EXIF focal hints, converted to registration-scale pixels.
-    var focalHints: [Int: Double] = [:]
-    for idx in group.imageIndices {
-        if let f35 = ImageLoader.focalLength35mm(url: urls[idx]) {
-            let longSide = Double(max(images[idx].width, images[idx].height))
-            focalHints[idx] = f35 / 36.0 * longSide
-        }
-    }
-
-    let sizes = images.map { (width: $0.width, height: $0.height) }
-    let alignStart = Date()
-    guard let alignment = PanoramaAligner.align(group: group, features: features,
-                                                imageSizes: sizes, focalHints: focalHints) else {
-        print("alignment failed")
+    let start = Date()
+    let panoramas = try Stitcher.stitch(urls: urls, settings: settings) { print($0) }
+    guard !panoramas.isEmpty else {
+        print("no panorama produced")
         exit(1)
     }
-    print("bundle adjustment: RMS \(String(format: "%.2f", alignment.finalRMS)) px in \(String(format: "%.2f", Date().timeIntervalSince(alignStart)))s")
-    for idx in alignment.cameras.keys.sorted() {
-        let cam = alignment.cameras[idx]!
-        let f35 = cam.focal * 36.0 / Double(max(cam.width, cam.height))
-        print("  \(urls[idx].lastPathComponent): f = \(String(format: "%.0f", cam.focal)) px (\(String(format: "%.1f", f35))mm equiv)")
-    }
-
-    var meshes: [Int: WarpMesh] = [:]
-    if useMesh {
-        let meshStart = Date()
-        let result = MeshRefiner.refine(group: group, features: features, cameras: alignment.cameras)
-        meshes = result.meshes
-        let maxOff = meshes.values.map(\.maxOffset).max() ?? 0
-        print("mesh refinement: parallax residual \(String(format: "%.2f", result.initialRMS)) → \(String(format: "%.2f", result.finalRMS)) px, max offset \(String(format: "%.1f", maxOff)) px, in \(String(format: "%.2f", Date().timeIntervalSince(meshStart)))s")
-    }
-
-    let renderStart = Date()
-    let finalImage: RGBImage
-    let horizontalDegrees: Double
-    if linearBlend {
-        var rgbImages: [Int: RGBImage] = [:]
-        for idx in alignment.cameras.keys {
-            rgbImages[idx] = try ImageLoader.loadRGB(url: urls[idx], maxDimension: maxDim)
-        }
-        guard let output = SphericalRenderer.render(cameras: alignment.cameras,
-                                                    images: rgbImages,
-                                                    meshes: meshes,
-                                                    outputWidth: outputWidth == 0 ? 4000 : outputWidth) else {
-            print("render failed")
-            exit(1)
-        }
-        finalImage = output.image
-        horizontalDegrees = (output.thetaRange.upperBound - output.thetaRange.lowerBound) * 180 / .pi
-    } else {
-        // Auto output width: the panorama's natural full-resolution span
-        // (angular span × mean focal scaled to source resolution), capped.
-        if outputWidth == 0 {
-            var natural = 4000.0
-            if let geoProbe = PanoGeometry(cameras: alignment.cameras, outputWidth: 1000) {
-                let span = geoProbe.thetaMax - geoProbe.thetaMin
-                var scaledFocals: [Double] = []
-                for (idx, cam) in alignment.cameras {
-                    if let dims = ImageLoader.pixelDimensions(url: urls[idx]) {
-                        let fullLong = Double(max(dims.width, dims.height))
-                        let regLong = Double(max(cam.width, cam.height))
-                        scaledFocals.append(cam.focal * fullLong / regLong)
-                    }
-                }
-                if !scaledFocals.isEmpty {
-                    let fMean = scaledFocals.reduce(0, +) / Double(scaledFocals.count)
-                    natural = span * fMean
-                }
-            }
-            outputWidth = min(Int(natural), 12000)
-            print("output width (auto): \(outputWidth) px")
-        }
-        var options = Compositor.Options()
-        options.outputWidth = outputWidth
-        options.crop = crop
-        guard let result = try Compositor.compose(cameras: alignment.cameras,
-                                                  meshes: meshes,
-                                                  options: options,
-                                                  imageProvider: { idx, maxDimension in
-            try ImageLoader.loadRGB(url: urls[idx], maxDimension: maxDimension)
-        }) else {
-            print("compositing failed")
-            exit(1)
-        }
-        let gainsText = result.gains.keys.sorted()
-            .map { String(format: "%.2f", result.gains[$0]!) }
-            .joined(separator: " ")
-        print("gain compensation: [\(gainsText)]")
-        finalImage = result.image
-        horizontalDegrees = (result.geometry.thetaMax - result.geometry.thetaMin) * 180 / .pi
-    }
-    print("rendered \(finalImage.width)x\(finalImage.height) (\(String(format: "%.0f", horizontalDegrees))° span) in \(String(format: "%.2f", Date().timeIntervalSince(renderStart)))s")
+    print("total: \(String(format: "%.1f", Date().timeIntervalSince(start)))s")
 
     let outURL = URL(fileURLWithPath: outPath)
-    try ImageLoader.writePNG(finalImage.makeCGImage(), to: outURL)
-    print("panorama: \(outURL.path)")
+    for (i, pano) in panoramas.enumerated() {
+        // First panorama gets the requested name; extras get -2, -3, …
+        let url: URL
+        if i == 0 {
+            url = outURL
+        } else {
+            let base = outURL.deletingPathExtension()
+            url = base.appendingPathExtension("\(i + 1).\(outURL.pathExtension)")
+        }
+        try ImageLoader.writeImage(pano.image.makeCGImage(), to: url)
+        print("panorama: \(url.path)")
+    }
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())

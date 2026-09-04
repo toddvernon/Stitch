@@ -8,10 +8,12 @@ roadmap; the source papers are in `docs/`.
 Requires macOS 14+. No dependencies.
 
 ```sh
-swift build -c release
+# The app: drop a folder of photos, preview, export
+Scripts/make-app.sh && open Stitch.app
 
-# Stitch a folder of photos into a panorama (linear-blend preview quality)
-.build/release/stitch pano Images/HiltonHeadHouse -o pano.png
+# The CLI: stitch a folder into full-resolution panoramas
+swift build -c release
+.build/release/stitch pano Images/HiltonHeadHouse -o pano.jpg
 
 # Inspect the pipeline stage by stage
 .build/release/stitch features photo.jpg --debug-out keypoints.png
@@ -19,9 +21,10 @@ swift build -c release
 .build/release/stitch recognize Images/HiltonHeadHouse
 ```
 
-Status: milestones 1-6 done — the full stitching pipeline: SIFT, matching/
-RANSAC/verification, panorama recognition, bundle adjustment + straightening,
-mesh-based parallax refinement, gain compensation, graph-cut seams, multi-band
-blending, and auto-crop, composited at the sources' native resolution by
-default (a 6-shot iPhone set renders a ~40 MP panorama in ~35 s). Next: the
-SwiftUI app.
+Status: all seven milestones done — the full stitching pipeline (SIFT,
+matching/RANSAC/verification, panorama recognition, bundle adjustment +
+straightening, mesh-based parallax refinement, gain compensation, graph-cut
+seams, multi-band blending, auto-crop) at the sources' native resolution
+(a 6-shot iPhone set renders a ~40 MP panorama in ~14 s), plus a drag-and-drop
+SwiftUI app. Open items: radial distortion in bundle adjustment, blender
+memory streaming, golden-image CI tests, app icon.

@@ -81,10 +81,26 @@ public enum ImageLoader {
     }
 
     public static func writePNG(_ cgImage: CGImage, to url: URL) throws {
-        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+        try writeImage(cgImage, to: url)
+    }
+
+    /// Writes PNG/JPEG/TIFF chosen by the destination's file extension
+    /// (default PNG).
+    public static func writeImage(_ cgImage: CGImage, to url: URL, jpegQuality: Double = 0.92) throws {
+        let type: UTType
+        switch url.pathExtension.lowercased() {
+        case "jpg", "jpeg": type = .jpeg
+        case "tif", "tiff": type = .tiff
+        default: type = .png
+        }
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, type.identifier as CFString, 1, nil) else {
             throw ImageLoaderError.cannotWrite(url)
         }
-        CGImageDestinationAddImage(dest, cgImage, nil)
+        var props: [CFString: Any] = [:]
+        if type == .jpeg {
+            props[kCGImageDestinationLossyCompressionQuality] = jpegQuality
+        }
+        CGImageDestinationAddImage(dest, cgImage, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else {
             throw ImageLoaderError.cannotWrite(url)
         }

@@ -7,10 +7,12 @@ public enum Compositor {
 
     public struct Options {
         public var outputWidth = 4000
-        /// Working width for gain/seam estimation.
-        public var seamWidth = 1200
+        /// Working width for gain/seam estimation. Kept small deliberately:
+        /// graph-cut cost grows steeply with node count, and seam placement
+        /// error of a few working pixels disappears under multi-band blending.
+        public var seamWidth = 700
         /// Long-side cap when loading sources for the low-res gain/seam pass.
-        public var seamSourceDimension = 1200
+        public var seamSourceDimension = 800
         public var blendLevels = 5
         public var crop = true
         public init() {}
@@ -56,7 +58,11 @@ public enum Compositor {
                                        levels: options.blendLevels)
         let sx = Double(geoLow.width) / Double(geoFull.width)
         for idx in indices {
-            let img = try imageProvider(idx, nil)
+            // Load each source no larger than the output resolution demands:
+            // pano px/rad divided by the camera's px/rad, with sampling margin.
+            let cam = cameras[idx]!
+            let needed = Double(max(cam.width, cam.height)) * geoFull.scale / cam.focal * 1.2
+            let img = try imageProvider(idx, Int(needed.rounded(.up)))
             guard var layer = LayerProjector.project(imageIndex: idx, camera: cameras[idx]!,
                                                      image: img, mesh: meshes[idx],
                                                      geometry: geoFull) else { continue }
