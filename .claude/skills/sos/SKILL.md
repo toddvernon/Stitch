@@ -32,7 +32,7 @@ behaves strangely, `rm -rf .build` and rebuild before suspecting the code.
 Untracked photo sets under `Images/` (folders of source shots and their
 stitched `<folder>.jpg`) are expected and are left untracked on purpose
 until the user decides to commit them; don't flag them as leftover work.
-`Images/HiltonHeadHouse` is the one committed test set.
+`Images/` is gitignored entirely; nothing under it is committed (the repo is public).
 
 ## 2. Reorient
 

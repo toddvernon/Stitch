@@ -45,13 +45,12 @@ https://github.com/toddvernon/Stitch, private for now.
 
 ## What's next
 
-- Decide about the untracked photo sets: Images/BeachWalk, Images/Sunrise
-  and their stitched outputs (about 130 MB) are sitting untracked. Commit
-  them as test sets like HiltonHeadHouse, or ignore them.
+- Photo sets: Images/ is now gitignored, so BeachWalk, Sunrise, the Rome and
+  Amalfi sets, and HiltonHeadHouse all stay local. Nothing to decide.
 - The open items from before, unchanged: radial distortion in bundle
   adjustment, blender memory streaming, golden-image CI tests, app icon.
-- If the repo ever goes public: add the MIT LICENSE file DESIGN.md
-  promises, and think about whether the house photos should ship with it.
+- (done 2026-09-09) Repo going public: MIT LICENSE added, Images/ untracked
+  and ignored. HiltonHeadHouse photos remain in earlier git history.
 
 ## Committed this session
 

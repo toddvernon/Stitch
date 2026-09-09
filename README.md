@@ -14,7 +14,7 @@ Scripts/make-app.sh && open Stitch.app
 
 # The CLI: stitch a folder into full-resolution panoramas
 swift build -c release
-.build/release/stitch pano Images/HiltonHeadHouse -o pano.jpg
+.build/release/stitch pano Images/MyPhotos -o pano.jpg
 
 # A walk along a facade: one long multi-viewpoint strip
 # (pano's default --mode auto picks this by itself when it fits better)
@@ -23,7 +23,7 @@ swift build -c release
 # Inspect the pipeline stage by stage
 .build/release/stitch features photo.jpg --debug-out keypoints.png
 .build/release/stitch match a.jpg b.jpg --debug-out matches.png
-.build/release/stitch recognize Images/HiltonHeadHouse
+.build/release/stitch recognize Images/MyPhotos
 ```
 
 Status: all seven milestones done — the full stitching pipeline (SIFT,
