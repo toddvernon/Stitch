@@ -1,7 +1,13 @@
+// Diagnostic renderings for `stitch features` and `stitch match`. Nothing
+// here is on the stitching path; it exists so each early stage can be
+// eyeballed in isolation, per the "every stage testable" goal in DESIGN.md.
+
 import CoreGraphics
 import Foundation
 
-/// Renders diagnostics (keypoint overlays, later: matches, seams) to CGImages.
+/// Renders diagnostics (keypoint overlays, feature matches) to CGImages.
+/// Both renderers paint the grayscale source into an RGBA bitmap by hand,
+/// then draw vectors over it with Core Graphics.
 public enum DebugRender {
 
     /// Grayscale base image with one circle per feature (radius = scale) and an
@@ -28,6 +34,7 @@ public enum DebugRender {
             ctx.setStrokeColor(CGColor(red: 1, green: 0.2, blue: 0.1, alpha: 0.9))
 
             for f in features {
+                // Sub-pixel scales still get a visible 1 px circle.
                 let r = CGFloat(max(f.scale, 1))
                 let cx = CGFloat(f.x), cy = CGFloat(f.y)
                 ctx.strokeEllipse(in: CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r))
@@ -41,7 +48,8 @@ public enum DebugRender {
     }
 
     /// Side-by-side pair with correspondence lines: green for inliers,
-    /// faint red for rejected putative matches.
+    /// faint red for rejected putative matches. Image B is offset by A's
+    /// width; `inlierIndices` index into `matches`.
     public static func matchOverlay(imageA: ImageF, imageB: ImageF,
                                     featuresA: [Feature], featuresB: [Feature],
                                     matches: [FeatureMatch], inlierIndices: [Int]) -> CGImage {
@@ -82,6 +90,7 @@ public enum DebugRender {
             }
             let outlierColor = CGColor(red: 1, green: 0.15, blue: 0.1, alpha: 0.25)
             let inlierColor = CGColor(red: 0.1, green: 0.95, blue: 0.2, alpha: 0.8)
+            // Outliers first so the inlier lines draw on top.
             for k in 0..<matches.count where !inliers.contains(k) {
                 drawMatch(k, color: outlierColor)
             }

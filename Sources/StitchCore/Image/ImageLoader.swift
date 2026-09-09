@@ -4,12 +4,21 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
+// All file I/O for the pipeline goes through Image I/O here: decoding to
+// grayscale for registration, EXIF lookups (focal length, GPS, orientation),
+// and writing finished panoramas with a marker so they are never re-ingested.
+// `RGBImage.swift` extends this with the full-resolution color loader.
+
+/// Failures are reported per URL so the CLI can name the offending file.
 public enum ImageLoaderError: Error {
     case cannotOpen(URL)
     case cannotDecode(URL)
     case cannotWrite(URL)
 }
 
+/// Stateless namespace over Image I/O and Core Graphics. Every function
+/// re-opens its source; nothing is cached, since each image is read at most
+/// twice (registration size, then full size for rendering).
 public enum ImageLoader {
 
     /// Loads an image as grayscale float [0,1], honoring EXIF orientation.
@@ -35,6 +44,9 @@ public enum ImageLoader {
                 options[kCGImageSourceThumbnailMaxPixelSize] = max(w, h)
             }
         }
+        // The thumbnail API is the fast path that both downsamples during
+        // decode and applies the orientation transform. The fallback decodes
+        // the full image unrotated; it only triggers on odd files.
         guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
             ?? CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw ImageLoaderError.cannotDecode(url)
@@ -42,6 +54,9 @@ public enum ImageLoader {
         return grayscale(from: cgImage)
     }
 
+    /// Converts any CGImage to a [0, 1] float plane by drawing it into an
+    /// 8-bit device-gray context (Core Graphics handles the color-space
+    /// conversion) and scaling with vDSP.
     public static func grayscale(from cgImage: CGImage) -> ImageF {
         let w = cgImage.width, h = cgImage.height
         var bytes = [UInt8](repeating: 0, count: w * h)
@@ -70,7 +85,9 @@ public enum ImageLoader {
         return (w, h)
     }
 
-    /// EXIF 35mm-equivalent focal length if present (for bundle-adjustment init later).
+    /// EXIF 35mm-equivalent focal length if present. `Stitcher` converts it
+    /// to pixels (f_px = f_35 / 36 × the long side) as the bundle adjuster's
+    /// initial estimate; without it the aligner uses the paper's default.
     public static func focalLength35mm(url: URL) -> Double? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -90,18 +107,23 @@ public enum ImageLoader {
               let lon = gps[kCGImagePropertyGPSLongitude] as? Double else {
             return nil
         }
+        // EXIF stores unsigned magnitudes with a hemisphere letter; fold the
+        // sign in so south and west come out negative.
         let latRef = gps[kCGImagePropertyGPSLatitudeRef] as? String ?? "N"
         let lonRef = gps[kCGImagePropertyGPSLongitudeRef] as? String ?? "E"
         return GPSCoordinate(latitude: latRef == "S" ? -lat : lat,
                              longitude: lonRef == "W" ? -lon : lon)
     }
 
+    /// Convenience kept for the debug commands; `writeImage` picks the
+    /// format from the extension and would do the same for a .png URL.
     public static func writePNG(_ cgImage: CGImage, to url: URL) throws {
         try writeImage(cgImage, to: url)
     }
 
     /// Writes PNG/JPEG/TIFF chosen by the destination's file extension
-    /// (default PNG).
+    /// (default PNG). JPEG quality 0.92 is visually lossless for panoramas
+    /// at a fraction of TIFF's size.
     public static func writeImage(_ cgImage: CGImage, to url: URL, jpegQuality: Double = 0.92) throws {
         let type: UTType
         switch url.pathExtension.lowercased() {
@@ -128,6 +150,7 @@ public enum ImageLoader {
         }
     }
 
+    /// Value written to the Software/CreatorTool field of every output.
     static let softwareTag = "Stitch"
 
     /// True if the file carries Stitch's own output marker, wherever the
@@ -144,6 +167,8 @@ public enum ImageLoader {
                 return true
             }
         }
+        // JPEG: Image I/O moved our TIFF Software entry into XMP on write,
+        // so read it back through the metadata tree rather than properties.
         if let meta = CGImageSourceCopyMetadataAtIndex(source, 0, nil),
            let tag = CGImageMetadataCopyTagMatchingImageProperty(
                meta, kCGImagePropertyTIFFDictionary, kCGImagePropertyTIFFSoftware),

@@ -1,10 +1,22 @@
+// Compositing stage 10, the last stop before crop. Takes the seam-labeled
+// full-resolution layers one at a time and produces the final RGB frame.
+// The seam mask decides which image owns each pixel; this class decides how
+// softly that ownership hands over, per frequency band.
+
 import Accelerate
 import Foundation
 
-/// Burt-Adelson multi-band blending (Brown & Lowe §7): each image's Laplacian
-/// pyramid is accumulated with weights from its seam mask's Gaussian pyramid,
-/// so low frequencies blend over large ranges and high frequencies over short
-/// ones. Validity-normalized pyramids keep invalid regions from bleeding dark.
+/// Burt-Adelson multi-band blending (Burt & Adelson 1983; Brown & Lowe §7):
+/// each image's Laplacian pyramid is accumulated with weights from its seam
+/// mask's Gaussian pyramid, so low frequencies blend over large ranges and
+/// high frequencies over short ones. Validity-normalized pyramids keep
+/// invalid regions from bleeding dark.
+///
+/// The normalization is the trick that makes tiling work: every pyramid
+/// carries colour premultiplied by validity alongside the validity itself,
+/// and the two are blurred and shrunk together. Dividing the pair back out
+/// (normalized convolution) gives a band that is correct right up to the
+/// layer's edge instead of fading toward the zero outside it.
 ///
 /// Each image is processed on a pyramid over its own bounding box, aligned to
 /// 2^(levels-1) so tile grids coincide exactly with the global accumulator
@@ -13,16 +25,25 @@ public final class MultiBandBlender {
     private let levels: Int
     private let outWidth: Int
     private let outHeight: Int
+    /// Tile and buffer alignment, 2^(levels-1): the coarsest level of an
+    /// aligned tile lands on integer pixels of the coarsest global level.
     private let align: Int
     private let sizes: [(w: Int, h: Int)]   // padded global sizes per level
+    // Per-level accumulators: Σ band·weight for each channel, and Σ weight.
+    // The final image at each level is num/den (Brown & Lowe eq. 35).
     private var numR: [ImageF] = []
     private var numG: [ImageF] = []
     private var numB: [ImageF] = []
     private var den: [ImageF] = []
 
+    /// Below this a weight or validity counts as zero; guards the divisions.
     private static let eps: Float = 1e-5
+    /// Anti-alias blur before each 2× decimation (the REDUCE step). Wider
+    /// than the classic 5-tap kernel, which suits photographic content.
     private static let pyramidSigma: Float = 2.0
 
+    /// Accumulators for a `width` × `height` output with `levels` bands.
+    /// Memory is about 4 × 4/3 × width × height floats.
     public init(width: Int, height: Int, levels: Int = 5) {
         self.levels = levels
         outWidth = width
@@ -43,6 +64,7 @@ public final class MultiBandBlender {
 
     // MARK: - Level helpers
 
+    /// REDUCE: Gaussian blur then 2× decimation.
     private static func shrink(_ img: ImageF) -> ImageF {
         let blurred = Convolution.gaussianBlur(img, sigma: pyramidSigma)
         return Convolution.resize(blurred, width: img.width / 2, height: img.height / 2)
@@ -66,6 +88,10 @@ public final class MultiBandBlender {
 
     /// Adds one image: `rgb`/`validity` are the layer patch, `seamMask` the 0/1
     /// seam ownership over the same patch, placed at (x0, y0) in pano space.
+    ///
+    /// Builds the image's Laplacian pyramid and the mask's Gaussian pyramid
+    /// level by level and accumulates each band into the global buffers, so
+    /// nothing per-image outlives this call.
     public func add(rgb: RGBImage, validity: ImageF, seamMask: ImageF, x0: Int, y0: Int) {
         // Tile bounding box aligned so tile grids match global grids per level.
         let gx0 = x0 / align * align
@@ -74,6 +100,9 @@ public final class MultiBandBlender {
         let lw = (dx + rgb.width + align - 1) / align * align
         let lh = (dy + rgb.height + align - 1) / align * align
 
+        // Level-0 tile: colour premultiplied by validity (cR, cG, cB), the
+        // validity itself (cV), and the seam weight (cW). All five go through
+        // the same REDUCE so they stay consistent at every level.
         var cR = ImageF(width: lw, height: lh)
         var cG = ImageF(width: lw, height: lh)
         var cB = ImageF(width: lw, height: lh)
@@ -98,6 +127,9 @@ public final class MultiBandBlender {
             let isLast = l == levels - 1
 
             // Weight active only where this level still has validity support.
+            // The shrunk seam mask is the Gaussian weight pyramid (eq. 33); it
+            // spreads past the layer's edge as it blurs, and this masks that
+            // spill so the layer never votes on pixels it has no data for.
             var wEff = ImageF(width: curW, height: curH)
             var vMask = [Float](repeating: 0, count: curW * curH)
             vDSP.threshold(cV.pixels, to: Self.eps, with: .zeroFill, result: &vMask)
@@ -110,6 +142,9 @@ public final class MultiBandBlender {
             let iG = Self.normalized(cG, by: cV)
             let iB = Self.normalized(cB, by: cV)
 
+            // Laplacian band: B_l = I_l − EXPAND(I_{l+1}), both validity-
+            // normalized. The coarsest level keeps its low-pass image whole so
+            // the collapse in finalize reconstructs exactly.
             var bandR = iR, bandG = iG, bandB = iB
             var nextR = cR, nextG = cG, nextB = cB, nextV = cV, nextW = cW
             if !isLast {
@@ -167,7 +202,10 @@ public final class MultiBandBlender {
 
     // MARK: - Output
 
-    /// Collapses the accumulated pyramid into the final panorama.
+    /// Collapses the accumulated pyramid into the final panorama: normalize
+    /// each level by its weight sum, then EXPAND from the coarsest level down,
+    /// adding the next finer band at each step (eq. 35 followed by the
+    /// Burt-Adelson reconstruction).
     public func finalize() -> RGBImage {
         var outR = Self.normalized(numR[levels - 1], by: den[levels - 1])
         var outG = Self.normalized(numG[levels - 1], by: den[levels - 1])
@@ -183,6 +221,8 @@ public final class MultiBandBlender {
             vDSP.add(outG.pixels, bandG.pixels, result: &outG.pixels)
             vDSP.add(outB.pixels, bandB.pixels, result: &outB.pixels)
         }
+        // Bands can overshoot near strong edges and gains can push past 1;
+        // this is the one place values are clipped to displayable range.
         vDSP.clip(outR.pixels, to: 0...1, result: &outR.pixels)
         vDSP.clip(outG.pixels, to: 0...1, result: &outG.pixels)
         vDSP.clip(outB.pixels, to: 0...1, result: &outB.pixels)

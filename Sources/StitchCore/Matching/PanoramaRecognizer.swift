@@ -1,16 +1,28 @@
 import Foundation
 
+// Stages 2 to 4 of the pipeline (DESIGN.md): match every image pair, verify
+// the promising ones with RANSAC, and group images into panoramas by
+// connected components. The groups go to PanoramaAligner (rotational) or
+// StripAligner (strip mode); images that verify with nothing are dropped.
+
 /// A verified geometric relationship between two images in a set.
 public struct VerifiedPair {
+    /// Image indices into the original set, with `indexA < indexB`.
     public var indexA: Int
     public var indexB: Int
+    /// All putative matches of the pair; `geometry.inlierIndices` picks out
+    /// the ones the model explains.
     public var matches: [FeatureMatch]
+    /// The fitted pair model (A pixels → B pixels) and its verification.
     public var geometry: PairGeometry
 }
 
 /// One recognized panorama: a connected component of verified image pairs.
 public struct PanoramaGroup {
+    /// Every image in the component, in original index order (which says
+    /// nothing about shooting order; the aligners work that out).
     public var imageIndices: [Int]
+    /// Every verified pair whose two images are both in the component.
     public var pairs: [VerifiedPair]
 }
 
@@ -21,9 +33,13 @@ public struct PanoramaGroup {
 /// model (see `PairModel`).
 public enum PanoramaRecognizer {
 
-    /// Candidate pairs per image, by raw match count (m in the paper).
+    /// Candidate pairs per image, by raw match count (m in the paper, §3.1).
     public static let candidatesPerImage = 6
 
+    /// Recognizes every panorama (or strip, with `model == .similarity`)
+    /// among `features`, one array per image; `imageSizes` are at the same
+    /// registration scale the features were detected at. Groups come back
+    /// largest first; images belonging to no group are simply absent.
     public static func recognize(features: [[Feature]],
                                  imageSizes: [(width: Int, height: Int)],
                                  model: PairModel = .homography) -> [PanoramaGroup] {
@@ -44,9 +60,11 @@ public enum PanoramaRecognizer {
             }
         }
 
-        // Keep each image's top-m candidates.
+        // Keep each image's top-m candidates. A pair survives if either image
+        // lists it, so a hub image with many neighbors doesn't starve them.
         var candidate = Set<Int>()  // encoded i*n+j with i<j
         for i in 0..<n {
+            // Under 4 raw matches nothing can verify under either model.
             for (j, count) in matchCounts[i].sorted(by: { $0.count > $1.count }).prefix(candidatesPerImage)
             where count >= 4 {
                 candidate.insert(min(i, j) * n + max(i, j))
@@ -67,7 +85,8 @@ public enum PanoramaRecognizer {
             pairs.append(VerifiedPair(indexA: i, indexB: j, matches: matches, geometry: geometry))
         }
 
-        // Connected components via union-find.
+        // Connected components via union-find (paper §3.3), with path
+        // compression so repeated finds stay cheap.
         var parent = Array(0..<n)
         func find(_ x: Int) -> Int {
             var root = x
@@ -84,6 +103,9 @@ public enum PanoramaRecognizer {
             parent[find(p.indexA)] = find(p.indexB)
         }
 
+        // Collect pairs and then images per root. Only roots that own a pair
+        // get an entry, so single-image components (noise images) never
+        // appear; the size filter below just states the contract.
         var groups: [Int: PanoramaGroup] = [:]
         for p in pairs {
             let root = find(p.indexA)

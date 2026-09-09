@@ -1,12 +1,19 @@
 import Foundation
 import simd
 
+// Stage 5 of the pipeline (DESIGN.md): joint refinement of every placed
+// camera's rotation and focal length. PanoramaAligner builds the
+// observations and calls `adjust` after each image it places; the dense
+// Cholesky solver at the bottom is shared with MeshRefiner and StripAligner.
+
 /// One correspondence used by bundle adjustment: the ray of `pointB` in camera
 /// B should project to `pointA` in camera A (centered pixel coordinates).
 /// Callers add each feature match in both directions.
 public struct MatchObservation {
+    /// Indices into the `cameras` array handed to `adjust`.
     public var cameraA: Int
     public var cameraB: Int
+    /// Centered pixel coordinates (see `Camera`), registration scale.
     public var pointA: SIMD2<Double>
     public var pointB: SIMD2<Double>
 
@@ -36,6 +43,9 @@ public enum BundleAdjuster {
         let nParams = nCams * 4
         guard nCams >= 2, !observations.isEmpty else { return rms(cameras, observations) }
 
+        // LM damping factor. It scales the prior precision (below) rather
+        // than the identity, so a rotation step and a focal step are damped
+        // in comparable units.
         var lambda = 1e-3
         var error = totalError(cameras, observations, huberSigma)
 
@@ -44,10 +54,13 @@ public enum BundleAdjuster {
             var g = [Double](repeating: 0, count: nParams)
             accumulateNormalEquations(cameras, observations, huberSigma, into: &a, gradient: &g)
 
+            // Paper §4.1: prior covariance C_p with σ_θ = π/16 rad and
+            // σ_f = f̄/10; the damped system is (JᵀWJ + λ·C_p⁻¹) δ = −JᵀWe.
             let fMean = cameras.map(\.focal).reduce(0, +) / Double(nCams)
             let sigmaTheta = Double.pi / 16
             let sigmaF = fMean / 10
 
+            // Up to 8 damping increases per outer iteration before giving up.
             var improved = false
             for _ in 0..<8 {
                 var damped = a
@@ -63,12 +76,19 @@ public enum BundleAdjuster {
                     lambda *= 10
                     continue
                 }
+                // Apply the step. The rotation update is right-multiplied
+                // (in the camera's own frame), matching how the Jacobian is
+                // built in `accumulateNormalEquations`. Focal floored at 10 px
+                // so a wild step can't drive it through zero.
                 var trial = cameras
                 for c in 0..<nCams {
                     let dTheta = SIMD3(delta[c * 4], delta[c * 4 + 1], delta[c * 4 + 2])
                     trial[c].rotation = trial[c].rotation * SO3.exp(dTheta)
                     trial[c].focal = max(trial[c].focal + delta[c * 4 + 3], 10)
                 }
+                // Marquardt's schedule: accept and ease damping toward
+                // Gauss-Newton, or reject and damp harder toward gradient
+                // descent. Stop once an accepted step barely moves the error.
                 let trialError = totalError(trial, observations, huberSigma)
                 if trialError < error {
                     cameras = trial
@@ -101,13 +121,17 @@ public enum BundleAdjuster {
                      ca.focal * p.y / p.z - o.pointA.y)
     }
 
-    /// Huber loss (paper eq. 17); σ = nil is plain L2.
+    /// Huber loss (paper eq. 17); σ = nil is plain L2. Quadratic inside σ,
+    /// linear outside, continuous at the knee.
     private static func huberLoss(_ normSq: Double, _ sigma: Double?) -> Double {
         guard let sigma else { return normSq }
         let n = sqrt(normSq)
         return n < sigma ? normSq : 2 * sigma * n - sigma * sigma
     }
 
+    /// The robustified objective (paper eq. 16). A ray that ends up behind
+    /// camera A costs a flat large penalty, so a step that swings a camera
+    /// around backwards is always rejected.
     private static func totalError(_ cams: [Camera], _ obs: [MatchObservation], _ sigma: Double?) -> Double {
         var e = 0.0
         let behindPenalty = 1e6
@@ -121,6 +145,8 @@ public enum BundleAdjuster {
         return e
     }
 
+    /// Unrobustified RMS reprojection error, px, over observations in front
+    /// of the camera. This is the figure callers report.
     private static func rms(_ cams: [Camera], _ obs: [MatchObservation]) -> Double {
         var sum = 0.0
         var count = 0
@@ -135,6 +161,10 @@ public enum BundleAdjuster {
 
     // MARK: - Normal equations
 
+    /// One Gauss-Newton linearization over all observations: accumulates
+    /// JᵀWJ into `a` and JᵀWe into `g` (paper §4.1, eqs. 18 to 21), W being
+    /// the IRLS Huber weight. Only the eight parameters of the two cameras in
+    /// an observation touch its rows, so each one adds an 8x8 block.
     private static func accumulateNormalEquations(_ cams: [Camera],
                                                   _ obs: [MatchObservation],
                                                   _ sigma: Double?,
@@ -167,17 +197,26 @@ public enum BundleAdjuster {
             ]
 
             // Columns of the 2x8 Jacobian: [θA(3), fA, θB(3), fB].
+            // ∂p/∂θ_A: rotating camera A by a small angle about generator k
+            // (right-multiplied, as in `adjust`) moves p by R_A·G_k·world.
+            // Camera B's rotation enters through `world` with the same
+            // generator and the opposite sign.
             var jac = [SIMD2<Double>](repeating: .zero, count: 8)
             for k in 0..<3 {
                 let dpA = ca.rotation * (SO3.generators[k] * world)
                 jac[k] = SIMD2(dot(dproj[0], dpA), dot(dproj[1], dpA))
                 jac[4 + k] = -jac[k]
             }
+            // ∂pixel/∂f_A = p/z, since the pixel is f·p/z. For f_B, the ray
+            // q_B = (x/f_B, y/f_B, 1) has ∂q_B/∂f_B = −(q_B.x, q_B.y, 0)/f_B.
             jac[3] = SIMD2(p.x / p.z, p.y / p.z)
             let dqB = SIMD3(-qB.x / cb.focal, -qB.y / cb.focal, 0)
             let dpB = ca.rotation * (cb.rotation.transpose * dqB)
             jac[7] = SIMD2(dot(dproj[0], dpB), dot(dproj[1], dpB))
 
+            // Scatter the upper triangle of the 8x8 block into the full
+            // symmetric matrix; the guard keeps diagonal entries from being
+            // added twice.
             let offsets = [o.cameraA * 4, o.cameraA * 4 + 1, o.cameraA * 4 + 2, o.cameraA * 4 + 3,
                            o.cameraB * 4, o.cameraB * 4 + 1, o.cameraB * 4 + 2, o.cameraB * 4 + 3]
             for r in 0..<8 {
@@ -201,6 +240,10 @@ public enum BundleAdjuster {
     }
 
     /// Dense Cholesky solve of A x = b for symmetric positive definite A.
+    /// Returns nil when a pivot is not positive (A not positive definite, or
+    /// numerically singular); the LM loop treats that as a failed step.
+    /// O(n³), fine for the sizes here: 4 unknowns per camera, up to about a
+    /// thousand for a warp mesh.
     static func choleskySolve(_ a: [Double], _ b: [Double], n: Int) -> [Double]? {
         var l = [Double](repeating: 0, count: n * n)
         for i in 0..<n {

@@ -1,6 +1,11 @@
 import Foundation
 import simd
 
+// Stage 3 of the pipeline (DESIGN.md): robust estimation of the pair model
+// (homography or similarity) over the putative matches of one candidate
+// pair, plus the verification test that decides whether the pair is a real
+// overlap. PanoramaRecognizer calls it once per candidate pair.
+
 /// Which motion model relates a pair of images.
 public enum PairModel: String, Sendable {
     /// Rotation about the lens: full 8-DOF homography (panoramas).
@@ -24,6 +29,8 @@ public struct PairGeometry {
     /// for homographies; the strip rule for similarities (see `PairEstimator`).
     public var isVerified: Bool
 
+    /// The model as a similarity, or nil when it was estimated as a full
+    /// homography (the last row is then generally not (0, 0, 1)).
     public var similarity: Similarity? { Similarity(homography: homography) }
 }
 
@@ -31,17 +38,29 @@ public struct PairGeometry {
 /// (Brown & Lowe IJCV 2007 §3 for the rotational model).
 public enum PairEstimator {
 
+    /// Rotational verification (paper §3.2, eq. 5): accept when
+    /// n_i > α + β·n_f. The paper derives α = 8.0, β = 0.3 from a Bayesian
+    /// test with p₁ = 0.6 (inlier rate for a true match), p₀ = 0.1 (for a
+    /// false one) and p_min = 0.999.
     public static let verificationAlpha = 8.0
     public static let verificationBeta = 0.3
 
     /// Strip verification: a similarity found from two-point samples with a
     /// depth-tolerant threshold has essentially no chance of collecting this
-    /// many spurious inliers, so a flat minimum is enough — plus sanity limits
+    /// many spurious inliers, so a flat minimum is enough, plus sanity limits
     /// on scale and rotation, since strips are shot square to the facade.
     public static let similarityMinInliers = 8
     public static let similarityScaleRange = 0.5...2.0
     public static let similarityMaxRotation = 20.0 * .pi / 180
 
+    /// RANSAC (Fischler & Bolles 1981) over `matches`, then verification of
+    /// the best model. `imageBWidth`/`imageBHeight` bound the overlap region
+    /// that defines n_f and, for the similarity model, set the default
+    /// inlier radius. `inlierThreshold` is in image-B pixels; nil picks the
+    /// model's default. `iterations` is the paper's 500 trials. Returns nil
+    /// when there are too few matches for a sample or no sample ever fits;
+    /// otherwise a geometry whose `isVerified` says whether the pair counts
+    /// as an overlap.
     public static func estimate(featuresA: [Feature],
                                 featuresB: [Feature],
                                 matches: [FeatureMatch],
@@ -51,18 +70,24 @@ public enum PairEstimator {
                                 iterations: Int = 500,
                                 inlierThreshold: Double? = nil,
                                 seed: UInt64 = 0x5EED) -> PairGeometry? {
+        // Minimal sample: 4 points determine a homography, 2 a similarity.
         let sampleSize = model == .homography ? 4 : 2
         guard matches.count >= sampleSize else { return nil }
 
         let ptsA = matches.map { SIMD2<Double>(Double(featuresA[$0.indexA].x), Double(featuresA[$0.indexA].y)) }
         let ptsB = matches.map { SIMD2<Double>(Double(featuresB[$0.indexB].x), Double(featuresB[$0.indexB].y)) }
-        // The similarity threshold is loose on purpose: a facade "plane" is a
+        // Inlier radius, in image-B pixels. 3 px for homographies at
+        // registration scale. The similarity threshold is loose on purpose
+        // (0.6% of the long side, 18 px at 3000): a facade "plane" is a
         // band of houses and trees at slightly different depths, whose motion
         // parallax must not split the true matches into competing models.
         let threshold = inlierThreshold ?? (model == .homography
             ? 3.0 : max(3.0, 0.006 * Double(max(imageBWidth, imageBHeight))))
         let threshSq = threshold * threshold
 
+        // Model from a sample (or from all inliers on the refit). Similarity
+        // fits outside the shooting-geometry limits are rejected here, so a
+        // degenerate sample can't win RANSAC with a pile of garbage inliers.
         func fit(_ idx: [Int]) -> Homography? {
             switch model {
             case .homography:
@@ -75,6 +100,9 @@ public enum PairEstimator {
             }
         }
 
+        // Seeded, so a given pair gives the same answer run to run and in
+        // tests. A fixed trial count rather than the adaptive stopping rule:
+        // 500 samples is the paper's number and cheap next to matching.
         var rng = SplitMix64(seed: seed)
         var bestInliers: [Int] = []
 
@@ -109,6 +137,8 @@ public enum PairEstimator {
             }
         }
 
+        // Verification: paper eq. 5 for the rotational model, the flat
+        // minimum for strips (see the constants above).
         let verified: Bool
         switch model {
         case .homography:
@@ -122,6 +152,8 @@ public enum PairEstimator {
                             isVerified: verified)
     }
 
+    /// `size` distinct indices in 0..<count, by rejection; fine because
+    /// size ≤ 4 and count is at least that.
     private static func randomSample(_ size: Int, count: Int, rng: inout SplitMix64) -> [Int] {
         var picked: [Int] = []
         picked.reserveCapacity(size)
@@ -133,7 +165,8 @@ public enum PairEstimator {
     }
 }
 
-/// Small deterministic RNG so RANSAC results are reproducible in tests.
+/// Small deterministic RNG so RANSAC results are reproducible in tests
+/// (Steele, Lea & Flood 2014; the constants are the reference ones).
 public struct SplitMix64: RandomNumberGenerator {
     private var state: UInt64
     public init(seed: UInt64) { state = seed }

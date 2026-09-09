@@ -3,7 +3,13 @@ import CoreGraphics
 import Foundation
 import ImageIO
 
-/// Planar float RGB image, values nominally [0, 1].
+// Three-plane color image for the compositing stages (gain, seams, blend)
+// and for output, plus the full-resolution RGB loader those stages use.
+// Registration never touches color; it works on `ImageF` grayscale.
+
+/// Planar float RGB image, values nominally [0, 1]. Three separate `ImageF`
+/// planes rather than interleaved pixels, so every per-channel operation
+/// (blur, pyramid, gain) reuses the single-channel code unchanged.
 public struct RGBImage {
     public var r: ImageF
     public var g: ImageF
@@ -24,10 +30,14 @@ public struct RGBImage {
         self.b = b
     }
 
+    /// Bilinear sample of all three planes; see `ImageF.sample` for the
+    /// coordinate convention and border clamping.
     public func sample(x: Float, y: Float) -> SIMD3<Float> {
         SIMD3(r.sample(x: x, y: y), g.sample(x: x, y: y), b.sample(x: x, y: y))
     }
 
+    /// Copies out a sub-rectangle, which must lie inside the image. Callers
+    /// are the compositor's auto-crop and the blender's final trim.
     public func cropped(x0: Int, y0: Int, width: Int, height: Int) -> RGBImage {
         var out = RGBImage(width: width, height: height)
         for y in 0..<height {
@@ -42,6 +52,8 @@ public struct RGBImage {
         return out
     }
 
+    /// 8-bit RGBA CGImage for display or `ImageLoader.writeImage`. Values
+    /// are clamped to [0, 1]; alpha is fully opaque.
     public func makeCGImage() -> CGImage {
         let w = width, h = height
         var rgba = [UInt8](repeating: 255, count: w * h * 4)
@@ -50,6 +62,7 @@ public struct RGBImage {
             rgba[i * 4 + 1] = UInt8(min(max(g.pixels[i] * 255, 0), 255))
             rgba[i * 4 + 2] = UInt8(min(max(b.pixels[i] * 255, 0), 255))
         }
+        // makeImage copies the bitmap, so the CGImage outlives `rgba`.
         return rgba.withUnsafeMutableBytes { buf in
             CGContext(data: buf.baseAddress, width: w, height: h,
                       bitsPerComponent: 8, bytesPerRow: w * 4,
@@ -78,6 +91,9 @@ extension ImageLoader {
         } else if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
                   let w = props[kCGImagePropertyPixelWidth] as? Int,
                   let h = props[kCGImagePropertyPixelHeight] as? Int {
+            // The thumbnail path is the only one that applies the EXIF
+            // transform, so request it at full size rather than falling
+            // back to CreateImageAtIndex, which would come out unrotated.
             options[kCGImageSourceThumbnailMaxPixelSize] = max(w, h)
         }
         guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
@@ -85,6 +101,8 @@ extension ImageLoader {
             throw ImageLoaderError.cannotDecode(url)
         }
 
+        // Draw into a known 8-bit RGBA layout so the source's own pixel
+        // format (16-bit, CMYK, indexed, whatever) never matters here.
         let w = cgImage.width, h = cgImage.height
         var rgba = [UInt8](repeating: 0, count: w * h * 4)
         rgba.withUnsafeMutableBytes { buf in

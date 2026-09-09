@@ -1,9 +1,16 @@
 import Foundation
 import simd
 
+// Step 3 of strip mode (DESIGN.md, "stitch strip"): the strip-mode
+// counterpart of PanoramaAligner plus BundleAdjuster. Takes a group that
+// PanoramaRecognizer built with the similarity model and places every image
+// on the facade plane in one linear solve; StripGeometry renders from it.
+
 /// Placement of every image of a strip on the dominant plane: a similarity
 /// from each image's registration-scale pixels into a shared strip frame.
 public struct StripAlignment {
+    /// Image index → similarity from that image's pixels (top-left origin)
+    /// into the strip frame.
     public var transforms: [Int: Similarity]
     /// Robust RMS of inlier residuals after the global solve, px at
     /// registration scale.
@@ -15,16 +22,25 @@ public struct StripAlignment {
 /// of every verified pair are solved together as one linear least-squares
 /// problem (a similarity is linear in its four parameters), robustified with
 /// a few Huber IRLS passes. The gauge is then fixed so the mean rotation is
-/// zero and the mean scale is one — "hold the camera level" rather than
+/// zero and the mean scale is one: "hold the camera level" rather than
 /// "walk in a straight line", since photographers are better at the former.
 public enum StripAligner {
 
+    /// Huber knee, px at registration scale: a little above feature
+    /// localization error plus the depth parallax within the facade band.
+    /// Residuals beyond it are weighted linearly instead of squared.
     public static let huberSigma = 3.0
+    /// Reweighting passes after the initial L2 solve. Few are needed because
+    /// RANSAC already removed the gross outliers.
     public static let irlsPasses = 4
 
+    /// Places every image of `group`. Returns nil for fewer than two images,
+    /// no inliers at all, or singular normal equations (which recognition
+    /// prevents: every image in a group has at least one verified pair).
     public static func align(group: PanoramaGroup, features: [[Feature]]) -> StripAlignment? {
         let indices = group.imageIndices.sorted()
         guard indices.count >= 2 else { return nil }
+        // Compact 0..<k slots for the group's images.
         let slot = Dictionary(uniqueKeysWithValues: indices.enumerated().map { ($1, $0) })
 
         // Correspondences: (slot i, point in i, slot j, point in j).
@@ -44,8 +60,10 @@ public enum StripAligner {
         }
         guard !obs.isEmpty else { return nil }
 
-        // Gauge: the best-connected image is the identity; the others are
-        // free. Unknowns x = (a, b, tx, ty) per free image.
+        // Gauge for the solve: the best-connected image is the identity and
+        // the others are free, unknowns x = (a, b, tx, ty) per free image.
+        // This is temporary; once the shape is known the mean-rotation and
+        // mean-scale gauge at the end replaces it.
         var degree = [Int](repeating: 0, count: indices.count)
         for o in obs {
             degree[o.i] += 1
@@ -64,6 +82,8 @@ public enum StripAligner {
         var weights = [Double](repeating: 1, count: obs.count)
         var rms = 0.0
 
+        // Pass 0 is plain least squares; each later pass reuses the previous
+        // residuals as Huber weights (IRLS).
         for pass in 0...irlsPasses {
             // Residual r = T_i(p) − T_j(q); each is 2 rows, linear in x.
             // Row for coordinate c of T_i(p): coefficients on (a_i, b_i, tx_i, ty_i)

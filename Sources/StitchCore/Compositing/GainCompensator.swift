@@ -1,10 +1,22 @@
+// Compositing stage 8. Runs on the low-resolution layers before seam
+// finding, so the seam cost sees exposure-matched images; the solved gains
+// are then applied again to the full-resolution layers before blending.
+
 import Foundation
 
 /// Closed-form gain compensation (Brown & Lowe IJCV 2007 §6): one gain per
 /// image minimizing normalized intensity error over all pairwise overlaps,
 /// with a prior keeping gains near 1. σ_N = 10/255, σ_g = 0.1 as in the paper.
+///
+/// Still the paper's single gain per image. DESIGN.md's block-based variant
+/// (a grid of gains, bilinearly interpolated, for vignetting and sky
+/// gradients) is an open upgrade; multi-band blending hides most of what a
+/// single gain leaves behind.
 public enum GainCompensator {
 
+    /// Gain per image index. Images with no usable overlap keep 1, and every
+    /// gain is clamped to [0.5, 2] so a bad overlap statistic (sky-only
+    /// overlap, a moving object) can neither blow out nor black out a photo.
     public static func solve(layers: [ImageLayer]) -> [Int: Double] {
         let n = layers.count
         guard n >= 2 else { return Dictionary(uniqueKeysWithValues: layers.map { ($0.imageIndex, 1.0) }) }
@@ -34,6 +46,8 @@ public enum GainCompensator {
                         sumB += Double(lb.rgb.r.pixels[ib] + lb.rgb.g.pixels[ib] + lb.rgb.b.pixels[ib]) / 3
                     }
                 }
+                // A handful of overlap pixels gives a meaningless mean;
+                // treat the pair as not overlapping.
                 guard nPix > 25 else { continue }
                 count[a * n + b] = nPix
                 count[b * n + a] = nPix
@@ -42,7 +56,12 @@ public enum GainCompensator {
             }
         }
 
-        // Normal equations of the paper's eq. 29.
+        // Normal equations of the paper's eq. 29:
+        //   e = Σ_ij N_ij [ (g_i·Ī_ij − g_j·Ī_ji)² / σ_N² + (1 − g_i)² / σ_g² ]
+        // is quadratic in the gains, so ∂e/∂g_i = 0 is one linear row per
+        // image: the diagonal collects both the data and the prior term, the
+        // off-diagonal couples i to each j it overlaps, and the right-hand
+        // side is the prior pulling toward 1.
         var a = [Double](repeating: 0, count: n * n)
         var b = [Double](repeating: 0, count: n)
         for i in 0..<n {
@@ -63,6 +82,8 @@ public enum GainCompensator {
             b[i] = 1
         }
 
+        // A is symmetric positive definite (the prior term guarantees it), so
+        // the bundle adjuster's Cholesky solver applies as is.
         guard let g = BundleAdjuster.choleskySolve(a, b, n: n) else {
             return Dictionary(uniqueKeysWithValues: layers.map { ($0.imageIndex, 1.0) })
         }
@@ -73,6 +94,8 @@ public enum GainCompensator {
         return result
     }
 
+    /// Multiplies the layer's RGB by `gain` in place. Validity and tent are
+    /// untouched; clipping to [0, 1] happens once, in the blender's finalize.
     public static func apply(gain: Double, to layer: inout ImageLayer) {
         let g = Float(gain)
         for i in layer.rgb.r.pixels.indices {

@@ -3,6 +3,14 @@ import StitchCore
 import SwiftUI
 import UniformTypeIdentifiers
 
+// The whole UI: a drop target that shows one of four screens depending on
+// the model's phase. Input comes in by drag-and-drop or the file importer;
+// output leaves through the save panel in PanoramaPane. Nothing here knows
+// about the pipeline beyond the two settings pickers.
+
+/// Root view. Owns the model and switches screens on its phase; the drop
+/// destination and importer are attached at this level so they work in
+/// every phase (a drop on the results screen starts a new stitch).
 struct ContentView: View {
     @StateObject private var model = StitchModel()
     @State private var showImporter = false
@@ -21,10 +29,14 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 720, minHeight: 480)
+        // Finder drops arrive as URLs; folders and files both go to the
+        // model, which resolves them the same way the CLI does.
         .dropDestination(for: URL.self) { urls, _ in
             model.stitch(dropped: urls)
             return true
         }
+        // Keyboard and menu path to the same thing, for people who do not
+        // drag. Folders and images can be mixed in one selection.
         .fileImporter(isPresented: $showImporter,
                       allowedContentTypes: [.folder, .image],
                       allowsMultipleSelection: true) { result in
@@ -36,6 +48,9 @@ struct ContentView: View {
 
     // MARK: - States
 
+    /// Idle: the drop target with the two pickers. Projection only applies
+    /// to the rotational model, so it is disabled when Strip is forced;
+    /// in Auto it is left enabled and simply ignored if a strip wins.
     private var dropPrompt: some View {
         VStack(spacing: 16) {
             Image(systemName: "photo.on.rectangle.angled")
@@ -69,6 +84,8 @@ struct ContentView: View {
         .padding(40)
     }
 
+    /// Running: the pipeline's progress lines in a monospaced log that
+    /// follows the newest entry, so a long strip render shows it is alive.
     private var progressView: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
@@ -97,6 +114,7 @@ struct ContentView: View {
         .padding(24)
     }
 
+    /// Done: the outputs, plus the way back to idle.
     private var resultsView: some View {
         VStack(spacing: 0) {
             TabViewOrSingle(results: model.results)
@@ -109,6 +127,7 @@ struct ContentView: View {
         }
     }
 
+    /// Failed: the model's message (already user-facing) and a retry.
     private func failureView(_ message: String) -> some View {
         VStack(spacing: 16) {
             Image(systemName: "exclamationmark.triangle")
@@ -141,6 +160,8 @@ private struct TabViewOrSingle: View {
     }
 }
 
+/// One output: the preview scaled to fit, its caption, and Export. The
+/// preview is the downscaled copy; export writes the full-resolution one.
 private struct PanoramaPane: View {
     let result: StitchModel.PanoResult
 
@@ -164,6 +185,10 @@ private struct PanoramaPane: View {
         .padding(16)
     }
 
+    /// Save panel, then the same writer the CLI uses, which picks the
+    /// format from the extension. JPEG is the default name because the
+    /// outputs are large and it is what gets shared; PNG and TIFF are a
+    /// rename away. Write errors surface as a standard alert.
     private func export(_ result: StitchModel.PanoResult) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png, .jpeg, .tiff]

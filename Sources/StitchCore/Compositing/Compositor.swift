@@ -1,3 +1,8 @@
+// Compositing stages 8 through 10 (DESIGN.md) as one driver: the only code
+// that orders gain, seams, and blending, and the only place full-resolution
+// sources are loaded. Stitcher calls compose(cameras:...) for panoramas and
+// compose(source:) with a StripGeometry for strips.
+
 import Foundation
 
 /// Milestone-6 compositing pipeline: project layers, compensate gain, find
@@ -7,6 +12,7 @@ import Foundation
 public enum Compositor {
 
     public struct Options {
+        /// Final output width in pixels; height follows from the geometry.
         public var outputWidth = 4000
         /// Working width for gain/seam estimation. Kept small deliberately:
         /// graph-cut cost grows steeply with node count, and seam placement
@@ -14,7 +20,12 @@ public enum Compositor {
         public var seamWidth = 700
         /// Long-side cap when loading sources for the low-res gain/seam pass.
         public var seamSourceDimension = 800
+        /// Pyramid depth for multi-band blending. 5 is Brown & Lowe's figure
+        /// and suits rotational panoramas, whose exposure differences gain
+        /// compensation mostly removes; strips use 8 (see DESIGN.md) because
+        /// their residual differences are local and need spreading further.
         public var blendLevels = 5
+        /// Crop to the largest rectangle with no uncovered pixels.
         public var crop = true
         /// nil = auto: Pannini under 160° of span, spherical above.
         public var projection: PanoProjection? = nil
@@ -38,6 +49,7 @@ public enum Compositor {
 
     public struct Result {
         public var image: RGBImage
+        /// Solved gain per image index, for logging and diagnostics.
         public var gains: [Int: Double]
     }
 
@@ -58,7 +70,11 @@ public enum Compositor {
         return (result, source.geometry)
     }
 
-    /// The shared compositing pass over any `LayerSource`.
+    /// The shared compositing pass over any `LayerSource`. Two passes over
+    /// the images: a low-resolution one where every layer is resident at once
+    /// (gain needs all pairwise overlaps, the graph cut needs all layers),
+    /// then a full-resolution one that loads, projects, and blends one image
+    /// at a time so peak memory is one full layer plus the blender's pyramid.
     public static func compose<S: LayerSource>(source full: S,
                                                options: Options = Options(),
                                                imageProvider: (Int, Int?) throws -> RGBImage) rethrows -> Result? {
@@ -74,6 +90,8 @@ public enum Compositor {
         }
         guard !lowLayers.isEmpty else { return nil }
 
+        // Gains are applied to the low-res layers before seam finding so the
+        // cut's intensity differences measure content, not exposure.
         let gains = GainCompensator.solve(layers: lowLayers)
         for i in lowLayers.indices {
             GainCompensator.apply(gain: gains[lowLayers[i].imageIndex] ?? 1, to: &lowLayers[i])
@@ -91,7 +109,10 @@ public enum Compositor {
             guard var layer = full.project(imageIndex: idx, image: img) else { continue }
             GainCompensator.apply(gain: gains[idx] ?? 1, to: &layer)
 
-            // Seam ownership for this layer, sampled from the low-res label map.
+            // Seam ownership for this layer, sampled from the low-res label
+            // map by nearest pixel. The blocky upsampled boundary is fine:
+            // the blender's Gaussian weight pyramid smooths it well past the
+            // sampling step.
             var seam = ImageF(width: layer.width, height: layer.height)
             let k = Int32(idx)
             for row in 0..<layer.height {
@@ -109,6 +130,9 @@ public enum Compositor {
 
         var image = blender.finalize()
         if options.crop {
+            // Only crop when the covered rectangle is a reasonable fraction
+            // of the frame; an odd-shaped mosaic is better left whole than
+            // reduced to a sliver.
             let rect = largestCoveredRect(coverage: blender.coverage)
             if rect.w > full.width / 4, rect.h > full.height / 4 {
                 image = image.cropped(x0: rect.x, y0: rect.y, width: rect.w, height: rect.h)
@@ -119,7 +143,11 @@ public enum Compositor {
 
     /// Largest axis-aligned rectangle containing only covered pixels
     /// (histogram-of-heights, computed on a decimated mask for speed).
+    /// Returns the whole frame if nothing is covered. Result is in coverage
+    /// pixels, snapped to the decimation step.
     static func largestCoveredRect(coverage: ImageF) -> (x: Int, y: Int, w: Int, h: Int) {
+        // Decimate to about 600 columns: the O(w·h) stack pass on a 13000 px
+        // strip would otherwise dominate, and a few-pixel crop error is moot.
         let step = max(1, coverage.width / 600)
         let w = coverage.width / step, h = coverage.height / step
         guard w > 0, h > 0 else { return (0, 0, coverage.width, coverage.height) }

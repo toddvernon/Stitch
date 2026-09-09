@@ -1,5 +1,10 @@
+// Advisory use of EXIF GPS positions (DESIGN.md, "GPS is advisory, never
+// required"). Feeds a log line, an explanation for unplaced photos, and the
+// auto-mode tiebreak in `Stitcher`. Positions never enter the geometry.
+
 import Foundation
 
+/// A WGS-84 position in signed decimal degrees (south and west negative).
 public struct GPSCoordinate: Equatable, Sendable {
     public var latitude: Double
     public var longitude: Double
@@ -12,7 +17,7 @@ public struct GPSCoordinate: Equatable, Sendable {
     /// Ground distance in meters (equirectangular approximation, plenty for
     /// the tens-to-hundreds of meters between shots).
     public func distance(to other: GPSCoordinate) -> Double {
-        let r = 6_371_000.0
+        let r = 6_371_000.0   // mean Earth radius, meters
         let lat1 = latitude * .pi / 180, lat2 = other.latitude * .pi / 180
         let dLat = lat2 - lat1
         let dLon = (other.longitude - longitude) * .pi / 180 * cos((lat1 + lat2) / 2)
@@ -22,16 +27,22 @@ public struct GPSCoordinate: Equatable, Sendable {
 
 /// What photo positions can tell us, and no more. Phone GPS is good to a
 /// few meters in the open, so it can say whether the photographer walked
-/// and roughly how far between shots — enough to explain a photo that
-/// didn't connect, and to break a tie in auto mode — but nothing about
+/// and roughly how far between shots: enough to explain a photo that
+/// didn't connect, and to break a tie in auto mode, but nothing about
 /// alignment, which the image content settles far more precisely. Every
 /// entry point tolerates missing positions; with none present, every
 /// result is nil or empty.
+///
+/// Photos are identified by their index into the caller's URL list, so
+/// a sparse dictionary represents "some photos have positions".
 public enum GPSHints {
 
     /// Positions this far apart are beyond GPS noise: the photographer moved.
+    /// Phone fixes scatter by 5 to 10 m even standing still, so 15 m is the
+    /// smallest span that reads as a deliberate step.
     public static let movedThreshold = 15.0
 
+    /// Reads the EXIF position of each URL; absent ones are simply omitted.
     public static func coordinates(urls: [URL]) -> [Int: GPSCoordinate] {
         var result: [Int: GPSCoordinate] = [:]
         for (i, url) in urls.enumerated() {
@@ -68,6 +79,8 @@ public enum GPSHints {
     }
 
     /// Median nearest-neighbor distance: the photographer's typical step.
+    /// The median ignores one dropped frame's large gap, which is exactly
+    /// the outlier `gapNotes` wants to measure against.
     public static func typicalStep(_ coords: [Int: GPSCoordinate]) -> Double? {
         let d = nearestNeighborDistances(coords).values.sorted()
         guard !d.isEmpty else { return nil }
@@ -94,6 +107,8 @@ public enum GPSHints {
         for i in unplaced.sorted() {
             guard let d = nearest[i] else { continue }
             let ratio = d / step
+            // 1.6× is beyond the spread of a steady walk but under the 2×
+            // of a single missing frame, so one dropped shot is caught.
             if ratio >= 1.6 {
                 notes.append("\(names[i]): \(Int(d.rounded())) m from the nearest photo, "
                              + "\(String(format: "%.1f", ratio))× the typical step — likely a missing frame, no overlap")

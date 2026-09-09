@@ -1,19 +1,31 @@
+// SIFT feature detection and description (Lowe, IJCV 2004): pipeline stage 1.
+// Every image passes through here once, at registration resolution; the
+// features feed the matcher, RANSAC verification, bundle adjustment, and the
+// mesh refiner. The structure and constants follow Lowe's paper and the
+// OpenCV/VLFeat implementations closely, so results are comparable to theirs.
+
 import Foundation
 
+/// Tunables for `SIFTDetector`. Defaults are Lowe's published values with the
+/// OpenCV contrast-threshold convention, as listed in DESIGN.md stage 1.
 public struct SIFTConfig {
     /// S in Lowe's paper: DoG layers searched for extrema per octave.
     public var scalesPerOctave = 3
     /// Blur of the base pyramid level.
     public var initialSigma: Float = 1.6
-    /// Blur assumed already present in the input image.
+    /// Blur assumed already present in the input image (Lowe §3.3: a camera
+    /// image is treated as having σ = 0.5, the minimum to avoid aliasing).
     public var assumedBlur: Float = 0.5
     /// Double the input before building the pyramid (more features, 4x cost).
+    /// Lowe recommends it; off here because registration images are already
+    /// downsampled and the extra small-scale features mostly add matcher load.
     public var doubleImage = false
     /// Contrast threshold, OpenCV convention: reject if |D(x̂)| * S < this.
     public var contrastThreshold: Float = 0.04
     /// Edge response ratio r; reject if tr²/det ≥ (r+1)²/r.
     public var edgeThreshold: Float = 10
     /// Keep only the strongest N features (by |DoG| response), nil = keep all.
+    /// Bounds matcher cost on very textured images.
     public var maxFeatures: Int? = nil
 
     public init() {}
@@ -22,39 +34,71 @@ public struct SIFTConfig {
 /// A detected feature: position/scale/orientation in input-image coordinates,
 /// plus a 128-dimensional SIFT descriptor (L2-normalized, 0.2-clipped).
 public struct Feature {
+    /// Position in input-image pixels, top-left origin (already divided back
+    /// by 2 when the detector doubled the image).
     public var x: Float
     public var y: Float
+    /// Absolute σ of the DoG layer the feature was found in, in input pixels.
+    /// Debug rendering draws the keypoint circle at this radius.
     public var scale: Float
+    /// Dominant gradient direction in radians, [0, 2π), image y-down.
     public var orientation: Float
+    /// Interpolated DoG value at the extremum; sign says bright-on-dark or
+    /// dark-on-bright. Only its magnitude is used, for `maxFeatures` ranking.
     public var response: Float
+    /// 128 floats: 4×4 spatial cells × 8 orientation bins, row-major by cell.
     public var descriptor: [Float]
 }
 
+/// The one seam between feature detection and the rest of the pipeline.
+/// `SIFTDetector` is the sole implementation; DESIGN.md reserves this for a
+/// learned extractor that could live in an optional non-core module.
 public protocol FeatureExtractor {
     func detect(in image: ImageF) -> [Feature]
 }
 
+/// Lowe's SIFT: DoG scale-space extrema, sub-pixel refinement, contrast and
+/// edge rejection, orientation assignment, and the 128-D gradient histogram
+/// descriptor. Runs single-threaded on one image; callers parallelize across
+/// images.
 public struct SIFTDetector: FeatureExtractor {
     public let config: SIFTConfig
     public init(config: SIFTConfig = SIFTConfig()) {
         self.config = config
     }
 
+    /// Pixels ignored at each edge of every DoG layer; the 3×3×3 extremum
+    /// test and the Hessian stencils need neighbors on all sides.
     private static let imageBorder = 5
+    /// Cap on the quadratic-fit iterations before a candidate is dropped as
+    /// unstable (it kept jumping to a neighboring sample).
     private static let maxInterpSteps = 5
+    /// Orientation histogram resolution: 36 bins of 10° (Lowe §5).
     private static let orientationBins = 36
+    /// Gaussian window for the orientation histogram is 1.5× the keypoint
+    /// scale (Lowe §5).
     private static let orientationSigmaFactor: Float = 1.5
+    /// Any histogram peak within 80% of the highest spawns its own keypoint
+    /// with that orientation (Lowe §5: about 15% of points get multiples,
+    /// and they matter for stability).
     private static let orientationPeakRatio: Float = 0.8
     private static let descriptorWidth = 4     // d: 4x4 spatial grid
     private static let descriptorOriBins = 8   // n: orientations per cell
+    /// Width of one descriptor cell in units of keypoint scale (Lowe §6.1
+    /// uses a 16×16 sample window at 3σ per cell, matching OpenCV).
     private static let descriptorSclFactor: Float = 3.0
+    /// Post-normalization clip so no single gradient dominates under
+    /// non-linear illumination change (Lowe §6.1).
     private static let descriptorMagThreshold: Float = 0.2
 
+    /// Full detection on one grayscale image. Coordinates and scales in the
+    /// result are in the input image's pixel frame regardless of `doubleImage`.
     public func detect(in image: ImageF) -> [Feature] {
         let base = makeBaseImage(image)
         let pyramid = ScaleSpacePyramid(baseImage: base, config: config)
         var features = findFeatures(pyramid: pyramid)
         if config.doubleImage {
+            // Pyramid coordinates are in the doubled image; map back.
             for i in features.indices {
                 features[i].x *= 0.5
                 features[i].y *= 0.5
@@ -62,12 +106,16 @@ public struct SIFTDetector: FeatureExtractor {
             }
         }
         if let cap = config.maxFeatures, features.count > cap {
+            // Strongest DoG responses survive; the same criterion OpenCV uses.
             features.sort { abs($0.response) > abs($1.response) }
             features.removeLast(features.count - cap)
         }
         return features
     }
 
+    /// Brings the input up to the pyramid's base blur `initialSigma`, adding
+    /// only the difference from the blur it already has (blurs add in
+    /// quadrature). Doubling the image doubles its existing blur too.
     private func makeBaseImage(_ image: ImageF) -> ImageF {
         var img = image
         var assumed = config.assumedBlur
@@ -75,12 +123,15 @@ public struct SIFTDetector: FeatureExtractor {
             img = Convolution.upsample2(img)
             assumed *= 2
         }
+        // The 0.01 floor guards a negative under the root when assumedBlur
+        // exceeds initialSigma; the blur then becomes a near no-op.
         let sigmaDiff = sqrtf(max(config.initialSigma * config.initialSigma - assumed * assumed, 0.01))
         return Convolution.gaussianBlur(img, sigma: sigmaDiff)
     }
 
     // MARK: - Extrema detection
 
+    /// A DoG extremum that survived refinement, still in octave coordinates.
     private struct Candidate {
         var octave: Int
         var layer: Int          // refined integer DoG layer
@@ -93,9 +144,15 @@ public struct SIFTDetector: FeatureExtractor {
         var octaveScale: Float  // sigma within the octave, for orientation/descriptor windows
     }
 
+    /// Scans every DoG layer 1...S of every octave for 3×3×3 extrema, then
+    /// refines each and turns survivors into oriented, described features.
+    /// Layers 0 and S+1 exist only as neighbors for the comparison.
     private func findFeatures(pyramid: ScaleSpacePyramid) -> [Feature] {
         let S = config.scalesPerOctave
         let border = Self.imageBorder
+        // Cheap early reject at half the final contrast threshold (OpenCV's
+        // convention): the interpolated value can only move so far from the
+        // sampled one, so anything below this cannot pass `refine`.
         let preThreshold = 0.5 * config.contrastThreshold / Float(S)
         var features: [Feature] = []
 
@@ -125,6 +182,9 @@ public struct SIFTDetector: FeatureExtractor {
         return features
     }
 
+    /// True if `v` at flat index `i` is strictly the max (or strictly the
+    /// min) of its 26 neighbors across the three DoG layers (Lowe §3.1).
+    /// Strict comparisons drop flat plateaus, which are unlocalizable anyway.
     @inline(__always)
     private func isExtremum(v: Float, i: Int, w: Int,
                             prev: UnsafeBufferPointer<Float>,
@@ -156,6 +216,10 @@ public struct SIFTDetector: FeatureExtractor {
         var l = layer, px = x, py = y
         var dx: Float = 0, dy: Float = 0, ds: Float = 0
 
+        // Fit D(x) ≈ D + ∇Dᵀx + ½ xᵀ H x around the sample and step to its
+        // stationary point x̂ = −H⁻¹∇D. If x̂ lands more than half a sample
+        // away, the extremum really belongs to a neighbor: move there and
+        // refit. Finite differences over (x, y, scale), central 3-point.
         for step in 0...Self.maxInterpSteps {
             let prev = dogs[l - 1], cur = dogs[l], next = dogs[l + 1]
             @inline(__always) func c(_ ix: Int, _ iy: Int) -> Float { cur[ix, iy] }
@@ -190,7 +254,9 @@ public struct SIFTDetector: FeatureExtractor {
                   py >= border, py < h - border else { return nil }
         }
 
-        // Contrast check at the interpolated position.
+        // Contrast check at the interpolated position: D(x̂) = D + ½ ∇Dᵀx̂
+        // (Lowe eq. 3). Multiplying by S matches the OpenCV convention, where
+        // the 0.04 threshold is quoted for DoG values scaled per layer.
         let cur = dogs[l]
         let gx = (cur[px + 1, py] - cur[px - 1, py]) * 0.5
         let gy = (cur[px, py + 1] - cur[px, py - 1]) * 0.5
@@ -198,7 +264,9 @@ public struct SIFTDetector: FeatureExtractor {
         let contrast = cur[px, py] + 0.5 * (gx * dx + gy * dy + gs * ds)
         guard abs(contrast) * Float(S) >= config.contrastThreshold else { return nil }
 
-        // Edge response: ratio of principal curvatures of the 2D spatial Hessian.
+        // Edge response (Lowe §4.1, eq. 4): reject if tr²/det ≥ (r+1)²/r,
+        // which means one principal curvature dwarfs the other, i.e. the
+        // point sits on an edge and slides along it. det ≤ 0 is a saddle.
         let v2 = cur[px, py] * 2
         let dxx = cur[px + 1, py] + cur[px - 1, py] - v2
         let dyy = cur[px, py + 1] + cur[px, py - 1] - v2
@@ -208,12 +276,15 @@ public struct SIFTDetector: FeatureExtractor {
         let r = config.edgeThreshold
         guard det > 0, trace * trace * r < (r + 1) * (r + 1) * det else { return nil }
 
+        // σ of the refined (fractional) layer within this octave.
         let octaveScale = config.initialSigma * powf(2, (Float(l) + ds) / Float(S))
         return Candidate(octave: octave, layer: l, x: px, y: py,
                          subX: dx, subY: dy, subLayer: ds,
                          response: contrast, octaveScale: octaveScale)
     }
 
+    /// Cramer's rule for the 3×3 Hessian system; nil when singular (the
+    /// candidate is then dropped rather than trusted).
     private static func solve3x3(a: (Float, Float, Float, Float, Float, Float, Float, Float, Float),
                                  b: (Float, Float, Float)) -> (Float, Float, Float)? {
         let (a11, a12, a13, a21, a22, a23, a31, a32, a33) = a
@@ -230,6 +301,11 @@ public struct SIFTDetector: FeatureExtractor {
 
     // MARK: - Orientation and descriptor
 
+    /// Assigns orientations and computes descriptors for one refined
+    /// candidate, emitting one `Feature` per dominant orientation. Gradients
+    /// are taken from the Gaussian level nearest the keypoint's scale so the
+    /// descriptor is scale-invariant (Lowe §5); positions are then mapped
+    /// from octave to base-image pixels by 2^octave.
     private func appendFeatures(for cand: Candidate, pyramid: ScaleSpacePyramid, into features: inout [Feature]) {
         let gauss = pyramid.gaussians[cand.octave][cand.layer]
         let angles = dominantOrientations(img: gauss, x: cand.x, y: cand.y, octaveScale: cand.octaveScale)
@@ -249,9 +325,14 @@ public struct SIFTDetector: FeatureExtractor {
         }
     }
 
+    /// Orientation assignment (Lowe §5): a Gaussian-weighted histogram of
+    /// gradient directions in a window around the keypoint, smoothed, then
+    /// every peak within `orientationPeakRatio` of the maximum, refined by
+    /// parabolic interpolation. Returns radians in [0, 2π).
     private func dominantOrientations(img: ImageF, x: Int, y: Int, octaveScale: Float) -> [Float] {
         let nBins = Self.orientationBins
         let sigma = Self.orientationSigmaFactor * octaveScale
+        // Window out to 3σ captures essentially all of the Gaussian weight.
         let radius = Int((3 * sigma).rounded())
         guard radius >= 1 else { return [] }
         var hist = [Float](repeating: 0, count: nBins)
@@ -275,7 +356,8 @@ public struct SIFTDetector: FeatureExtractor {
             }
         }
 
-        // Two passes of circular [1,4,6,4,1]/16 smoothing.
+        // Two passes of circular [1,4,6,4,1]/16 smoothing, so a single noisy
+        // bin cannot split one true peak into two (VLFeat does the same).
         for _ in 0..<2 {
             let src = hist
             for i in 0..<nBins {
@@ -291,6 +373,7 @@ public struct SIFTDetector: FeatureExtractor {
             let left = hist[(i + nBins - 1) % nBins]
             let right = hist[(i + 1) % nBins]
             if hist[i] > left, hist[i] > right, hist[i] >= Self.orientationPeakRatio * maxVal {
+                // Parabola through the three bins gives the sub-bin peak.
                 var bin = Float(i) + 0.5 * (left - right) / (left - 2 * hist[i] + right)
                 if bin < 0 { bin += Float(nBins) }
                 if bin >= Float(nBins) { bin -= Float(nBins) }
@@ -300,16 +383,29 @@ public struct SIFTDetector: FeatureExtractor {
         return angles
     }
 
+    /// The descriptor (Lowe §6): gradients in a window rotated to `angle`
+    /// and scaled to `octaveScale` are binned into a d×d grid of n-bin
+    /// orientation histograms with trilinear interpolation, then normalized,
+    /// clipped at 0.2, and renormalized. Layout mirrors OpenCV's so
+    /// descriptors are interchangeable for debugging.
     private func descriptor(img: ImageF, x: Float, y: Float, angle: Float, octaveScale: Float) -> [Float] {
         let d = Self.descriptorWidth
         let n = Self.descriptorOriBins
+        // One cell spans histWidth pixels at this keypoint's scale.
         let histWidth = Self.descriptorSclFactor * octaveScale
+        // The rotated d×d grid (plus one cell of interpolation margin) fits
+        // inside a circle of this radius; the image diagonal caps it for
+        // huge scales.
         var radius = Int((histWidth * sqrtf(2) * Float(d + 1) * 0.5).rounded())
         radius = min(radius, Int(sqrtf(Float(img.width * img.width + img.height * img.height))))
 
+        // Rotation into the keypoint frame, pre-divided by cell width so the
+        // rotated offsets are directly in cell units.
         let cosT = cosf(angle) / histWidth
         let sinT = sinf(angle) / histWidth
         let binsPerRad = Float(n) / (2 * .pi)
+        // Gaussian weight with σ = half the descriptor width (Lowe §6.1), in
+        // cell units: exp(−(r² + c²) / (2·(d/2)²)).
         let expScale: Float = -2.0 / Float(d * d)
         let cx = Int(x.rounded()), cy = Int(y.rounded())
 
@@ -324,6 +420,8 @@ public struct SIFTDetector: FeatureExtractor {
                 let px = cx + j
                 guard px > 0, px < img.width - 1 else { continue }
 
+                // Sample offset in the rotated frame, in cell units, then
+                // shifted so cell centers sit on integers 0...d−1.
                 let cRot = Float(j) * cosT - Float(i) * sinT
                 let rRot = Float(j) * sinT + Float(i) * cosT
                 let rBin = rRot + Float(d) / 2 - 0.5
@@ -332,6 +430,8 @@ public struct SIFTDetector: FeatureExtractor {
 
                 let dx = img[px + 1, py] - img[px - 1, py]
                 let dy = img[px, py + 1] - img[px, py - 1]
+                // Gradient direction relative to the keypoint orientation:
+                // this is what makes the descriptor rotation-invariant.
                 var theta = atan2f(dy, dx) - angle
                 while theta < 0 { theta += 2 * .pi }
                 while theta >= 2 * .pi { theta -= 2 * .pi }
@@ -345,6 +445,9 @@ public struct SIFTDetector: FeatureExtractor {
                 let dr = rBin - Float(r0), dc = cBin - Float(c0), dob = oBin - Float(o0)
                 if o0 >= n { o0 -= n }
 
+                // Trilinear spread over the 2×2×2 neighboring bins (Lowe
+                // §6.1) so a sample sliding across a cell boundary changes
+                // the descriptor smoothly. The +1 skips the margin cell.
                 for (ri, rw) in [(r0, 1 - dr), (r0 + 1, dr)] {
                     for (ci, cw) in [(c0, 1 - dc), (c0 + 1, dc)] {
                         let w0 = mag * rw * cw
@@ -355,6 +458,7 @@ public struct SIFTDetector: FeatureExtractor {
             }
         }
 
+        // Drop the margin ring and flatten to d·d·n, cell-major.
         var desc = [Float](repeating: 0, count: d * d * n)
         var k = 0
         for r in 1...d {
@@ -366,6 +470,8 @@ public struct SIFTDetector: FeatureExtractor {
             }
         }
 
+        // Unit length for contrast invariance, clip large entries so a few
+        // strong gradients cannot dominate, renormalize (Lowe §6.1).
         normalize(&desc)
         var clipped = false
         for i in desc.indices where desc[i] > Self.descriptorMagThreshold {
@@ -376,6 +482,7 @@ public struct SIFTDetector: FeatureExtractor {
         return desc
     }
 
+    /// In-place L2 normalization; leaves an all-zero vector alone.
     private func normalize(_ v: inout [Float]) {
         var sum: Float = 0
         for x in v { sum += x * x }

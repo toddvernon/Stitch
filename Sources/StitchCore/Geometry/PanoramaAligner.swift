@@ -1,9 +1,16 @@
 import Foundation
 import simd
 
+// Stages 5 and 6 of the pipeline (DESIGN.md): the incremental placement
+// schedule that drives BundleAdjuster, and automatic straightening. Takes a
+// recognized PanoramaGroup and returns a Camera per image for MeshRefiner
+// and the compositor.
+
 /// Cameras for one panorama group, keyed by image index in the original set.
 public struct AlignmentResult {
     public var cameras: [Int: Camera]
+    /// RMS reprojection error of the final robust pass, px at registration
+    /// scale.
     public var finalRMS: Double
 }
 
@@ -13,6 +20,11 @@ public struct AlignmentResult {
 /// (L2 during growth, Huber σ=2px for the final polish), then straighten.
 public enum PanoramaAligner {
 
+    /// Aligns one group. `focalHints` are EXIF-derived focal lengths in
+    /// registration-scale pixels, keyed by image index; an image without one
+    /// starts at 0.9 × its long side (about a 32 mm lens on full frame),
+    /// which bundle adjustment corrects within a few iterations. Returns nil
+    /// for groups under two images or with no verified pair.
     public static func align(group: PanoramaGroup,
                              features: [[Feature]],
                              imageSizes: [(width: Int, height: Int)],
@@ -26,13 +38,16 @@ public enum PanoramaAligner {
             Camera(focal: defaultFocal(idx), width: imageSizes[idx].width, height: imageSizes[idx].height)
         }
 
-        // Inlier counts between image pairs, for placement order.
+        // Inlier counts between image pairs, for placement order. (Currently
+        // unused: the placement loop below reads the pair list directly.)
         var inlierCount: [Int: Int] = [:]  // key: min*N+max over image indices
         let n = features.count
         for p in group.pairs {
             inlierCount[min(p.indexA, p.indexB) * n + max(p.indexA, p.indexB)] = p.geometry.inlierIndices.count
         }
 
+        // Seed with the pair holding the most inliers (paper §4: the best
+        // matching pair first), the most trustworthy homography to decompose.
         guard let seedPair = group.pairs.max(by: { $0.geometry.inlierIndices.count < $1.geometry.inlierIndices.count })
         else { return nil }
 
@@ -42,6 +57,9 @@ public enum PanoramaAligner {
         initializeRotation(of: &camB, from: cameras[seedPair.indexA]!, pair: seedPair, placedIsA: true)
         cameras[seedPair.indexB] = camB
 
+        // Bundle adjust after every addition (the paper's schedule), so each
+        // new image is initialized against cameras that already agree with
+        // each other rather than against a single unrefined neighbor.
         var remaining = Set(group.imageIndices).subtracting(cameras.keys)
         runBA(cameras: &cameras, group: group, features: features, huberSigma: nil)
 
@@ -62,6 +80,9 @@ public enum PanoramaAligner {
                     bestPair = p
                 }
             }
+            // No pair bridges placed and unplaced: the group is not connected
+            // (shouldn't happen for a connected component). Stop rather than
+            // guess.
             guard let image = bestImage, let pair = bestPair else { break }
 
             var cam = makeCamera(image)
@@ -74,15 +95,19 @@ public enum PanoramaAligner {
             runBA(cameras: &cameras, group: group, features: features, huberSigma: nil)
         }
 
+        // Final polish with the robust loss and a longer iteration budget,
+        // then straighten.
         let finalRMS = runBA(cameras: &cameras, group: group, features: features,
                              huberSigma: 2.0, maxIterations: 60)
         straighten(cameras: &cameras)
         return AlignmentResult(cameras: cameras, finalRMS: finalRMS)
     }
 
-    /// Initialize an unplaced camera's rotation from a verified pair with a
-    /// placed one: R_B = (K_B⁻¹ · H_c · K_A · R_Aᵀ)ᵀ-style decomposition of
-    /// the pair homography (paper eq. 1), projected back onto SO(3).
+    /// Initialize an unplaced camera's rotation from its verified pair with
+    /// a placed one, by decomposing the pair homography H = K_B R_B R_Aᵀ K_A⁻¹
+    /// (paper eq. 1): R_B R_Aᵀ ≈ K_B⁻¹ H K_A up to scale, projected back onto
+    /// SO(3). The intrinsics are whatever the cameras currently hold, so the
+    /// result is approximate; the bundle adjustment that follows fixes it.
     private static func initializeRotation(of camera: inout Camera, from placed: Camera,
                                            pair: VerifiedPair, placedIsA: Bool) {
         // pair.geometry.homography maps A pixels (top-left origin) → B pixels.
@@ -106,10 +131,15 @@ public enum PanoramaAligner {
         }
     }
 
+    /// Pure-translation homography, for moving between top-left and centered
+    /// pixel origins.
     private static func translation(_ x: Double, _ y: Double) -> simd_double3x3 {
         simd_double3x3(rows: [SIMD3(1, 0, x), SIMD3(0, 1, y), SIMD3(0, 0, 1)])
     }
 
+    /// Divides out a homography's arbitrary projective scale using
+    /// det(sR) = s³, so what reaches `orthonormalize` is close to a rotation
+    /// rather than a multiple of one (and has positive determinant).
     private static func normalizeScale(_ m: simd_double3x3) -> simd_double3x3 {
         let det = m.determinant
         guard abs(det) > 1e-12 else { return m }
@@ -140,6 +170,8 @@ public enum PanoramaAligner {
                 let fb = features[p.indexB][m.indexB]
                 let pa = ca.centered(SIMD2(Double(fa.x), Double(fa.y)))
                 let pb = cb.centered(SIMD2(Double(fb.x), Double(fb.y)))
+                // Both directions, so the error is symmetric in the pair
+                // (paper eq. 8 sums over the residuals in both images).
                 observations.append(MatchObservation(cameraA: la, cameraB: lb, pointA: pa, pointB: pb))
                 observations.append(MatchObservation(cameraA: lb, cameraB: la, pointA: pb, pointB: pa))
             }
@@ -158,6 +190,8 @@ public enum PanoramaAligner {
     /// and the mean viewing direction is forward.
     static func straighten(cameras: inout [Int: Camera]) {
         guard cameras.count >= 2 else { return }
+        // The X axes of a hand-held pan all lie roughly in the horizontal
+        // plane; the direction they span least is the vertical.
         var cov = [Double](repeating: 0, count: 9)
         var meanUp = SIMD3<Double>.zero
         var meanForward = SIMD3<Double>.zero
@@ -175,10 +209,14 @@ public enum PanoramaAligner {
             meanForward += forward
         }
         guard let u = HomographyEstimator.smallestEigenvector(cov, n: 3) else { return }
+        // An eigenvector has no sign; orient it along the cameras' mean up so
+        // the panorama doesn't come out upside down.
         var up = SIMD3(u[0], u[1], u[2])
         if dot(up, meanUp) < 0 { up = -up }
         up = normalize(up)
 
+        // Forward = mean viewing direction made perpendicular to up, so the
+        // straightened world has the panorama centered dead ahead.
         var forward = meanForward - dot(meanForward, up) * up
         guard length(forward) > 1e-9 else { return }
         forward = normalize(forward)

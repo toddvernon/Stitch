@@ -1,6 +1,16 @@
 import Foundation
 import StitchCore
 
+// The `stitch` command-line tool. Each subcommand exposes one pipeline stage
+// for inspection (features, match, recognize) or runs the whole thing (pano,
+// strip). Options are parsed by hand: a handful of flags per command does not
+// justify a dependency, and the package stays dependency-free by design.
+// All real work is in StitchCore; this file only maps flags to Settings and
+// prints what comes back.
+
+/// Prints the usage text and exits. 64 is EX_USAGE from sysexits(3), so a
+/// bad invocation is distinguishable from a pipeline failure (1); `help`
+/// passes 0 so run.sh and scripts can show it without tripping `set -e`.
 func usage(exitCode: Int32 = 64) -> Never {
     print("""
     usage: stitch <command> [options]
@@ -56,11 +66,14 @@ func usage(exitCode: Int32 = 64) -> Never {
     exit(exitCode)
 }
 
+/// `stitch features`: pipeline stage 1 on a single image, with timings.
+/// The keypoint overlay is the quickest way to see whether a photo has
+/// usable texture (sky and sand yield almost nothing).
 func runFeatures(_ args: [String]) throws {
     var inputPath: String?
     var debugOut: String?
-    var maxDim = 2000
-    var doubleImage = false
+    var maxDim = 2000        // same registration cap the pipeline uses
+    var doubleImage = false  // Lowe 2004 §3.3 first-octave upsampling; 4x the work
 
     var it = args.makeIterator()
     while let arg = it.next() {
@@ -74,6 +87,8 @@ func runFeatures(_ args: [String]) throws {
         case "--double":
             doubleImage = true
         default:
+            // Anything else is the positional input; a second one or an
+            // unknown flag is a usage error rather than a silent ignore.
             if arg.hasPrefix("-") || inputPath != nil { usage() }
             inputPath = arg
         }
@@ -111,6 +126,11 @@ func runFeatures(_ args: [String]) throws {
     }
 }
 
+/// `stitch match`: stages 2 and 3 on one pair. Prints the putative match
+/// count, RANSAC inliers, the verification decision with the numbers behind
+/// it, and the estimated transform, so a pair that fails to connect in
+/// `recognize` can be examined on its own. `--strip` swaps in the
+/// similarity model and the strip verification rule.
 func runMatch(_ args: [String]) throws {
     var inputPaths: [String] = []
     var debugOut: String?
@@ -162,6 +182,9 @@ func runMatch(_ args: [String]) throws {
         return
     }
 
+    // Paper §3.2: accept the pair if n_i > α + β·n_f, n_f being the matches
+    // that fall inside the overlap region. Strips use a flat minimum instead
+    // (DESIGN.md, strip step 2), since the facade band yields few matches.
     let ni = geometry.inlierIndices.count
     let nf = geometry.overlapMatchCount
     let threshold = PairEstimator.verificationAlpha + PairEstimator.verificationBeta * Double(nf)
@@ -173,6 +196,9 @@ func runMatch(_ args: [String]) throws {
         print("verification: n_i=\(ni) \(geometry.isVerified ? ">" : "<=") \(String(format: "%.1f", threshold))  →  \(geometry.isVerified ? "MATCH" : "NO MATCH")")
     }
 
+    // simd matrices index column first, so h[c][r] printed across c gives
+    // row r. For the similarity model this is the same transform lifted to
+    // a 3x3.
     let h = geometry.homography
     for r in 0..<3 {
         print(String(format: "  H[%d] = [%10.5f %10.5f %10.5f]", r, h[0][r], h[1][r], h[2][r]))
@@ -188,7 +214,10 @@ func runMatch(_ args: [String]) throws {
     }
 }
 
-/// Shared front half of recognize/pano: load, detect, recognize.
+/// Front half of the pipeline (load, detect, recognize) for `recognize`,
+/// which wants the groups and pair inliers rather than a render. `pano`
+/// goes through `Stitcher.stitch` instead, so this loop is deliberately a
+/// small duplicate of the one in there.
 func recognizePanoramas(folder: String, maxDim: Int, model: PairModel = .homography) throws
     -> (urls: [URL], images: [ImageF], features: [[Feature]], groups: [PanoramaGroup]) {
     let urls = Stitcher.imageURLs(from: [URL(fileURLWithPath: folder)])
@@ -213,6 +242,9 @@ func recognizePanoramas(folder: String, maxDim: Int, model: PairModel = .homogra
     return (urls, images, features, groups)
 }
 
+/// `stitch recognize`: stage 4 on a folder. Lists each group with its
+/// verified pairs and inlier counts, then the photos that connected to
+/// nothing. The first thing to run on a folder that stitches badly.
 func runRecognize(_ args: [String]) throws {
     var folder: String?
     var maxDim = 2000
@@ -251,6 +283,11 @@ func runRecognize(_ args: [String]) throws {
     }
 }
 
+/// `stitch pano` and `stitch strip`, which is just `pano --mode strip`.
+/// Maps flags onto `Stitcher.Settings`, runs the pipeline with progress
+/// lines echoed to stdout, and writes every recognized output. Defaults
+/// (registration caps, blend levels, seam locality) come from Settings so
+/// the CLI and app cannot drift apart.
 func runPano(_ args: [String], mode: Stitcher.Mode = .auto) throws {
     var folder: String?
     var outPath: String?
@@ -263,6 +300,8 @@ func runPano(_ args: [String], mode: Stitcher.Mode = .auto) throws {
             guard let v = it.next() else { usage() }
             outPath = v
         case "--max-dim":
+            // An explicit cap overrides both defaults, including the strip's
+            // higher 3000 px one; the user asked for a specific resolution.
             guard let v = it.next(), let n = Int(v), n > 0 else { usage() }
             settings.registrationMaxDimension = n
             settings.stripRegistrationMaxDimension = n
@@ -274,6 +313,8 @@ func runPano(_ args: [String], mode: Stitcher.Mode = .auto) throws {
         case "--no-crop":
             settings.crop = false
         case "--projection":
+            // "auto" is not a PanoProjection case; nil means let the span
+            // decide (Pannini under 160°, spherical above).
             guard let v = it.next() else { usage() }
             if v == "auto" {
                 settings.projection = nil
@@ -303,6 +344,8 @@ func runPano(_ args: [String], mode: Stitcher.Mode = .auto) throws {
         print("need at least 2 images in \(folder)")
         exit(1)
     }
+    // Progress lines go straight to stdout; the pipeline is synchronous
+    // here, unlike in the app, so there is no thread hop.
     let start = Date()
     let panoramas = try Stitcher.stitch(urls: urls, settings: settings) { print($0) }
     guard !panoramas.isEmpty else {
@@ -326,6 +369,9 @@ func runPano(_ args: [String], mode: Stitcher.Mode = .auto) throws {
     }
 }
 
+// Entry point: first argument selects the subcommand, the rest go to it
+// untouched. Errors thrown by StitchCore (unreadable file, write failure)
+// land on stderr with exit 1; usage errors exit 64 from `usage()` itself.
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else { usage() }
 

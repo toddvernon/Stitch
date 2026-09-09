@@ -1,9 +1,14 @@
+// Strip mode's LayerSource (DESIGN.md, "stitch strip", step 4). The
+// counterpart of PanoLayerSource: StripAligner's per-image similarities in
+// place of cameras, a plane in place of the sphere. The compositor cannot
+// tell the two apart.
+
 import Foundation
 import simd
 
 /// Output space for a multi-viewpoint strip: the dominant (facade) plane
 /// itself. Each image reaches it through one similarity, so the whole strip
-/// is a flat mosaic — no sphere, no projection choice — and the seam finder
+/// is a flat mosaic, no sphere and no projection choice, and the seam finder
 /// does the multi-viewpoint selection (Agarwala et al. 2006), preferring the
 /// photo taken most directly in front of each region.
 public struct StripGeometry: LayerSource {
@@ -17,9 +22,13 @@ public struct StripGeometry: LayerSource {
     public let extent: SIMD2<Double>
     /// Output pixels per strip-frame unit.
     public let scale: Double
+    /// Output size in pixels; height follows from the extent's aspect.
     public let width: Int
     public let height: Int
 
+    /// Bounds the strip frame by the transformed corners of every image (a
+    /// similarity maps straight edges to straight edges, so corners suffice)
+    /// and sizes the output to `outputWidth`. nil if the extent is empty.
     public init?(transforms: [Int: Similarity],
                  sizes: [Int: (width: Int, height: Int)],
                  outputWidth: Int) {
@@ -52,6 +61,7 @@ public struct StripGeometry: LayerSource {
 
     public var imageIndices: [Int] { transforms.keys.sorted() }
 
+    /// Same frame and extent at a different output resolution.
     public func scaled(toWidth newWidth: Int) -> StripGeometry {
         StripGeometry(transforms: transforms, sizes: sizes, origin: origin, extent: extent,
                       outputWidth: newWidth)
@@ -60,6 +70,8 @@ public struct StripGeometry: LayerSource {
     /// Output px per registration px of the image, with sampling margin.
     public func sourceDimension(for imageIndex: Int) -> Int {
         let size = sizes[imageIndex]!
+        // The similarity's own scale enters too: an image the solver shrank
+        // needs proportionally less source resolution. 1.2 is bilinear headroom.
         let needed = Double(max(size.width, size.height)) * scale * transforms[imageIndex]!.scale * 1.2
         return Int(needed.rounded(.up))
     }
@@ -74,10 +86,14 @@ public struct StripGeometry: LayerSource {
         (p - origin) * scale - SIMD2(0.5, 0.5)
     }
 
+    /// Inverse-maps every output pixel in the image's bounding box back
+    /// through the similarity and bilinearly samples the source.
     public func project(imageIndex: Int, image: RGBImage) -> ImageLayer? {
         guard let t = transforms[imageIndex], let size = sizes[imageIndex] else { return nil }
         let w = Double(size.width), h = Double(size.height)
 
+        // Bounding box in output pixels from the four transformed corners,
+        // padded 2 px for rounding and the bilinear footprint.
         var xMin = Double.infinity, xMax = -Double.infinity
         var yMin = Double.infinity, yMax = -Double.infinity
         for corner in [SIMD2(0, 0), SIMD2(w, 0), SIMD2(0, h), SIMD2(w, h)] {
@@ -98,10 +114,13 @@ public struct StripGeometry: LayerSource {
         var validity = ImageF(width: lw, height: lh)
         var tent = ImageF(width: lw, height: lh)
 
+        // The similarity is in registration-scale pixels; the image handed in
+        // may be full resolution, so sample through the size ratio.
         let inv = t.inverse
         let imgScaleX = Double(image.width) / w
         let imgScaleY = Double(image.height) / h
 
+        // Row-parallel; each output row is written by exactly one thread.
         rgb.r.pixels.withUnsafeMutableBufferPointer { rp in
         rgb.g.pixels.withUnsafeMutableBufferPointer { gp in
         rgb.b.pixels.withUnsafeMutableBufferPointer { bp in
@@ -118,6 +137,11 @@ public struct StripGeometry: LayerSource {
                     gp[i] = c.y
                     bp[i] = c.z
                     vp[i] = 1
+                    // Tent weight, 1 at the image center falling to 0 at the
+                    // edges. This is what the seam locality term reads to
+                    // prefer the photo shot most directly in front of each
+                    // region. Floored so a pixel covered by only one image
+                    // never has zero weight.
                     let wx = 1 - abs(2 * s.x / w - 1)
                     let wy = 1 - abs(2 * s.y / h - 1)
                     tp[i] = Float(max(wx * wy, 1e-5))
