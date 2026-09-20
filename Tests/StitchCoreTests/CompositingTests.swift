@@ -59,6 +59,87 @@ final class CompositingTests: XCTestCase {
         XCTAssertEqual((ga + gb) / 2, 1.0, accuracy: 0.1)
     }
 
+    func testGainMapBilinear() {
+        let m = GainMap(cols: 2, rows: 1, values: [1.0, 2.0])
+        // Block centers hold their values; halfway between them interpolates;
+        // beyond the outer centers the edge value holds.
+        XCTAssertEqual(m.gain(u: 0.25, v: 0.5), 1.0, accuracy: 1e-12)
+        XCTAssertEqual(m.gain(u: 0.75, v: 0.5), 2.0, accuracy: 1e-12)
+        XCTAssertEqual(m.gain(u: 0.5, v: 0.5), 1.5, accuracy: 1e-12)
+        XCTAssertEqual(m.gain(u: 0.0, v: 0.5), 1.0, accuracy: 1e-12)
+        XCTAssertEqual(m.gain(u: 1.0, v: 0.5), 2.0, accuracy: 1e-12)
+        XCTAssertEqual(GainMap(constant: 0.8).gain(u: 0.3, v: 0.9), 0.8, accuracy: 1e-12)
+    }
+
+    func testBlockGainMatchesSingleGainOnUniformExposure() {
+        // Same setup as the single-gain test: block gains should come out
+        // flat across each image and equalize about as far.
+        let a = constantLayer(index: 0, x0: 0, y0: 0, w: 100, h: 60, value: 0.40)
+        let b = constantLayer(index: 1, x0: 50, y0: 0, w: 100, h: 60, value: 0.50)
+        let maps = GainCompensator.solveBlocks(layers: [a, b], blocksAcross: 5, minBlockSize: 10)
+        let ma = maps[0]!, mb = maps[1]!
+        XCTAssertLessThan(ma.values.max()! - ma.values.min()!, 0.02, "uniform image gets a flat map")
+        XCTAssertLessThan(mb.values.max()! - mb.values.min()!, 0.02)
+        XCTAssertLessThan(abs(ma.mean * 0.40 - mb.mean * 0.50), 0.033)
+        XCTAssertGreaterThan(ma.mean, mb.mean)
+        XCTAssertEqual((ma.mean + mb.mean) / 2, 1.0, accuracy: 0.1)
+    }
+
+    func testBlockGainCorrectsSpatiallyVaryingExposure() {
+        // B is 25% brighter than A in its top half only (a sky that the phone
+        // exposed differently) and identical in the bottom half. One gain per
+        // image has to compromise; block gains should fix the top without
+        // disturbing the bottom.
+        let a = constantLayer(index: 0, x0: 0, y0: 0, w: 100, h: 60, value: 0.40)
+        var b = constantLayer(index: 1, x0: 50, y0: 0, w: 100, h: 60, value: 0.40)
+        for y in 0..<30 {
+            for x in 0..<100 {
+                b.rgb.r.pixels[y * 100 + x] = 0.50
+                b.rgb.g.pixels[y * 100 + x] = 0.50
+                b.rgb.b.pixels[y * 100 + x] = 0.50
+            }
+        }
+        // Mismatch in the overlap (pano x 50..<100) for a pair of corrected
+        // layers, over a band of rows.
+        func mismatch(_ la: ImageLayer, _ lb: ImageLayer, rows: Range<Int>) -> Float {
+            var worst: Float = 0
+            for y in rows {
+                for x in 50..<100 {
+                    worst = max(worst, abs(la.rgb.r.pixels[y * 100 + x] - lb.rgb.r.pixels[y * 100 + (x - 50)]))
+                }
+            }
+            return worst
+        }
+        // Single gain: one compromise for both halves.
+        var sa = a, sb = b
+        let single = GainCompensator.solve(layers: [a, b])
+        GainCompensator.apply(gain: single[0]!, to: &sa)
+        GainCompensator.apply(gain: single[1]!, to: &sb)
+        // Block gain: 5×3 blocks over each 100×60 layer, so the top and
+        // bottom block rows are centered at y = 10 and y = 50.
+        var la = a, lb = b
+        let maps = GainCompensator.solveBlocks(layers: [a, b], blocksAcross: 5, minBlockSize: 10)
+        GainCompensator.apply(map: maps[0]!, to: &la)
+        GainCompensator.apply(map: maps[1]!, to: &lb)
+        let top = 4..<16, bottom = 44..<56
+        XCTAssertLessThan(mismatch(la, lb, rows: top), mismatch(sa, sb, rows: top),
+                          "block gain beats the single gain where exposure differs")
+        XCTAssertLessThan(mismatch(la, lb, rows: bottom), mismatch(sa, sb, rows: bottom),
+                          "and where it does not")
+        // Absolute: the 0.10 top gap shrinks by about half. The paper's
+        // prior and the block smoothness both stop short of full
+        // equalization (the single-gain test documents the same), which is
+        // exactly what the Hilton Head sky showed. The matched bottom is
+        // not pushed apart.
+        XCTAssertLessThan(mismatch(la, lb, rows: top), 0.05)
+        XCTAssertLessThan(mismatch(la, lb, rows: bottom), 0.02)
+        // And the map itself carries the structure: B's top blocks gain
+        // down relative to its bottom blocks.
+        let mb = maps[1]!
+        let topRow = Array(mb.values[0..<mb.cols]), bottomRow = Array(mb.values[(mb.rows - 1) * mb.cols..<mb.values.count])
+        XCTAssertLessThan(topRow.reduce(0, +) / Double(mb.cols), bottomRow.reduce(0, +) / Double(mb.cols))
+    }
+
     // MARK: - Seams
 
     /// Two half-overlapping images identical in the overlap except a bright

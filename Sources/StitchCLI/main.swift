@@ -31,12 +31,15 @@ func usage(exitCode: Int32 = 64) -> Never {
           similarity model and strip verification instead.
 
       pano <folder> -o <out.png|jpg|tiff> [--max-dim <N>] [--width <W>]
-                    [--no-mesh] [--no-crop] [--projection <p>] [--mode <m>]
+                    [--no-mesh] [--no-crop] [--projection <p>] [--mode <m>] [--gain <g>]
           --mode: auto (default), panorama, or strip. Auto recognizes both
           ways and keeps whichever places more images.
           --projection: spherical, cylindrical, pannini, or auto (default:
           pannini under 160° of span for a natural perspective look,
           spherical above).
+          --gain: single (default; one gain per image) or block (a grid of
+          gains per image, so sky and ground are corrected separately;
+          experimental).
           Full pipeline: recognize, bundle adjust, straighten, refine parallax
           with warp meshes (skip with --no-mesh), then composite with gain
           compensation, graph-cut seams, and multi-band blending, cropped to
@@ -332,6 +335,9 @@ func runPano(_ args: [String], mode: Stitcher.Mode = .auto) throws {
         case "--blend-levels":
             guard let v = it.next(), let n = Int(v), n >= 1 else { usage() }
             settings.stripBlendLevels = n
+        case "--gain":
+            guard let v = it.next(), let g = Compositor.GainMode(rawValue: v) else { usage() }
+            settings.gainMode = g
         default:
             if arg.hasPrefix("-") || folder != nil { usage() }
             folder = arg

@@ -90,6 +90,9 @@ public enum Stitcher {
         /// walk) and gain compensation can't remove them; wider blend bands
         /// spread what remains over hundreds of pixels.
         public var stripBlendLevels = 8
+        /// The paper's single gain per image by default. `.block` (a grid of
+        /// gains per image) is in evaluation; see `Compositor.GainMode`.
+        public var gainMode: Compositor.GainMode = .single
         public init() {}
     }
 
@@ -274,6 +277,7 @@ public enum Stitcher {
         options.outputWidth = width
         options.crop = settings.crop
         options.projection = projection
+        options.gainMode = settings.gainMode
         progress("\(tag)compositing…")
         guard let (composed, geometry) = try Compositor.compose(cameras: alignment.cameras,
                                                                 meshes: meshes,
@@ -284,6 +288,7 @@ public enum Stitcher {
             progress("\(tag)compositing failed, skipping")
             return nil
         }
+        progress("\(tag)" + gainSummary(composed.gainMaps, names: urls.map(\.lastPathComponent)))
         let degrees = (geometry.thetaMax - geometry.thetaMin) * 180 / .pi
         progress("\(tag)rendered \(composed.image.width)x\(composed.image.height) (\(String(format: "%.0f", degrees))° span)")
         return StitchedPanorama(image: composed.image,
@@ -334,6 +339,7 @@ public enum Stitcher {
         options.crop = settings.crop
         options.seamLocalityWeight = settings.stripSeamLocality
         options.blendLevels = settings.stripBlendLevels
+        options.gainMode = settings.gainMode
         // Strips are wide and short: size the seam pass by area (what the
         // graph cut's cost depends on), keeping the pixel budget of a 16:9
         // pass at the default width.
@@ -348,6 +354,7 @@ public enum Stitcher {
             progress("\(tag)compositing failed, skipping")
             return nil
         }
+        progress("\(tag)" + gainSummary(composed.gainMaps, names: urls.map(\.lastPathComponent)))
         progress("\(tag)rendered \(composed.image.width)x\(composed.image.height)")
         return StitchedPanorama(image: composed.image,
                                 sourceURLs: group.imageIndices.sorted().map { urls[$0] },
@@ -420,5 +427,18 @@ public enum Stitcher {
         return files
             .filter { !ImageLoader.isStitchOutput(url: $0) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    /// One log line summarizing the solved gains: per image, the mean and,
+    /// in block mode, the range across its blocks. The spread is the quick
+    /// tell for whether block gain found anything a single gain could not.
+    static func gainSummary(_ maps: [Int: GainMap], names: [String]) -> String {
+        let parts = maps.keys.sorted().map { idx -> String in
+            let m = maps[idx]!
+            let name = names[idx].replacingOccurrences(of: ".jpeg", with: "").replacingOccurrences(of: ".jpg", with: "")
+            if m.values.count == 1 { return String(format: "%@ %.2f", name, m.values[0]) }
+            return String(format: "%@ %.2f [%.2f, %.2f]", name, m.mean, m.values.min()!, m.values.max()!)
+        }
+        return "gains: " + parts.joined(separator: "  ")
     }
 }

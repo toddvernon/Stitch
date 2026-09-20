@@ -33,7 +33,21 @@ public enum Compositor {
         /// pixel (see `SeamFinder`). 0 for panoramas; strips set it so each
         /// region comes from the photo taken most directly in front of it.
         public var seamLocalityWeight = 0.0
+        /// How exposure differences are corrected before seams and blending.
+        /// Single until block mode is shown to beat it (see STATUS.md).
+        public var gainMode: GainMode = .single
         public init() {}
+    }
+
+    /// Gain compensation model (see `GainCompensator`).
+    public enum GainMode: String, CaseIterable, Sendable {
+        /// Brown & Lowe's one gain per image. The default.
+        case single
+        /// A coarse grid of gains per image, so sky and ground can be
+        /// corrected by different amounts. Experimental: on the Hilton Head
+        /// set it closes only part of the sky step, because the residual is
+        /// a per-channel (white balance) shift a luminance gain cannot fix.
+        case block
     }
 
     /// The auto rule: Pannini flatters wide architecture but degrades past
@@ -49,8 +63,11 @@ public enum Compositor {
 
     public struct Result {
         public var image: RGBImage
-        /// Solved gain per image index, for logging and diagnostics.
+        /// Solved gain per image index, for logging and diagnostics. In
+        /// block mode this is the mean over the image's blocks.
         public var gains: [Int: Double]
+        /// The full per-image gain maps (1×1 in single mode).
+        public var gainMaps: [Int: GainMap]
     }
 
     /// Rotational panorama: builds the `PanoLayerSource` and composites.
@@ -92,9 +109,17 @@ public enum Compositor {
 
         // Gains are applied to the low-res layers before seam finding so the
         // cut's intensity differences measure content, not exposure.
-        let gains = GainCompensator.solve(layers: lowLayers)
+        let gainMaps: [Int: GainMap]
+        switch options.gainMode {
+        case .single:
+            gainMaps = GainCompensator.solve(layers: lowLayers).mapValues { GainMap(constant: $0) }
+        case .block:
+            gainMaps = GainCompensator.solveBlocks(layers: lowLayers)
+        }
+        let gains = gainMaps.mapValues(\.mean)
         for i in lowLayers.indices {
-            GainCompensator.apply(gain: gains[lowLayers[i].imageIndex] ?? 1, to: &lowLayers[i])
+            GainCompensator.apply(map: gainMaps[lowLayers[i].imageIndex] ?? GainMap(constant: 1),
+                                  to: &lowLayers[i])
         }
 
         let labels = SeamFinder.labels(layers: lowLayers, width: low.width, height: low.height,
@@ -107,7 +132,9 @@ public enum Compositor {
         for idx in indices {
             let img = try imageProvider(idx, full.sourceDimension(for: idx))
             guard var layer = full.project(imageIndex: idx, image: img) else { continue }
-            GainCompensator.apply(gain: gains[idx] ?? 1, to: &layer)
+            // The map was solved on the low-res layer; its normalized grid
+            // stretches over this layer's box the same way.
+            GainCompensator.apply(map: gainMaps[idx] ?? GainMap(constant: 1), to: &layer)
 
             // Seam ownership for this layer, sampled from the low-res label
             // map by nearest pixel. The blocky upsampled boundary is fine:
@@ -138,7 +165,7 @@ public enum Compositor {
                 image = image.cropped(x0: rect.x, y0: rect.y, width: rect.w, height: rect.h)
             }
         }
-        return Result(image: image, gains: gains)
+        return Result(image: image, gains: gains, gainMaps: gainMaps)
     }
 
     /// Largest axis-aligned rectangle containing only covered pixels

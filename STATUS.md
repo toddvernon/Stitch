@@ -1,59 +1,86 @@
 # STATUS
 
-Rolled at end of session, read by /sos. Current as of 2026-09-04, end of day.
+Rolled at end of session, read by /sos. Current as of 2026-09-20.
 
 ## The session, in one breath
 
-Strip mode landed. The BeachWalk set (walking along the row of houses at
-Hilton Head, one shot per house) now stitches into a single multi-viewpoint
-strip, and the app and CLI pick panorama or strip on their own. Then GPS
-hints went in as pure diagnostics, and the repo got its first remote:
-https://github.com/toddvernon/Stitch, private for now.
+The repo went public (MIT LICENSE, photos untracked), the whole codebase got
+a proper comment pass, and then I went after the sky band in the Hilton Head
+panorama. Block-based gain compensation is built and behind a flag, but it
+turned out not to be the whole answer: the residual across that seam is a
+white-balance shift, not a brightness one.
 
 ## What's working
 
-- The full rotational pipeline (milestones 1 through 7) unchanged, and
-  verified unchanged: Hilton Head renders identically and in the same 25 s
-  on the pre-strip build. The README's 14 s figure predates the Pannini
-  projection and the wider natural width; it was stale before today.
-- Strip mode (39e7d06). Similarity pair model with 2-point RANSAC, global
-  linear solve with Huber IRLS, planar output through a LayerSource
-  protocol the compositor is now generic over, and a viewpoint-locality
-  term in the graph cut. Strips register at 3000 px (2000 only chained 3
-  of the 5 connectable BeachWalk photos) and blend with 8 pyramid levels
-  (5 left a vertical band in the sky). BeachWalk: 5 photos, 13020x3885,
-  about 20 s. Seam locality is 0.01; 0 let a seam run through a house and
-  duplicate it, 0.005 and 0.02 both looked fine, so I split the difference.
-- Auto mode: both recognizers run on the same features and whichever
-  places more images wins, panorama on a tie. Strip winning triggers a
-  re-detect at 3000 px. run.sh on a folder therefore just does the right
-  thing.
-- GPS hints (d87d6da). Advisory only, never required, never in the
-  geometry. Log line with span and typical step, an explanation for
-  unplaced photos that sit far beyond the typical step, and the auto-mode
-  tiebreak. Verified silent and identical on metadata-stripped copies.
-- 39 tests green.
+- Everything from before: rotational pipeline, strip mode, auto mode, GPS
+  hints. Hilton Head still renders byte-identical to the reference with the
+  default settings.
+- Public repo at https://github.com/toddvernon/Stitch. Images/ is gitignored
+  entirely; the house photos remain in earlier history, which I decided was
+  fine.
+- Comment pass (e68d156): file headers, doc comments on the public surface,
+  paper citations at the algorithms, rationale at every magic number.
+- Block gain (this session's last commit): `GainCompensator.solveBlocks`
+  solves a coarse grid of gains per image (about 10 blocks across, tied by a
+  smoothness term, same data and prior terms as the paper), `GainMap`
+  interpolates it bilinearly, and the compositor applies it at both
+  resolutions. `stitch pano --gain block` turns it on; the default is still
+  `single`. The stitch log now prints each image's gain mean and range.
+- 42 tests green.
+
+## The sky band, what I learned
+
+The visible tell in Hilton Head is the sky above the left trees, at the
+seam between IMG_4001 and IMG_4002 (about 31% across). Things I ruled out
+with measurements, so nobody has to redo them:
+
+- Not the seam position. The graph cut puts it mid-overlap, not on a
+  coverage edge. Seam locality 0.01 and 0.05 don't move it.
+- Not blend depth. 8 pyramid levels instead of 5 leaves the sky profile
+  identical to within a gray level.
+- Only partly gain. Block gains close roughly half the step; weakening the
+  prior (sigma_g 0.3 or 1.0) and the smoothness helps a little more, but
+  the gain-corrected low-res mosaic still shows a clear step.
+- The rest is color. Across the seam the sky differs by about 18% in red,
+  12% in green, 8% in blue. The phone changed white balance and tone curve
+  between frames (shutter went from 1/4673 to 1/7353 across the set). A
+  luminance gain leaves a 10% red mismatch, which reads as the lighter,
+  less saturated band.
+
+So the fix is per-channel block gains: solve the same block system three
+times, once per channel, with a weaker prior. Half a day. After that, if a
+residual remains, it is tone-curve nonlinearity and the answer is shooting
+with AE/AF lock.
 
 ## Known limits, not bugs
 
-- IMG_4026 in BeachWalk has no overlap with anything: 4024 and 4025 were
-  dropped, and the GPS line now says so (60 m from its neighbor, 2.2x the
-  typical step). Reshoot without gaps if that end of the row matters.
-- Near sand in a strip can never align (different viewpoints, content off
-  the facade plane); seams there are soft but findable. Expected per
-  DESIGN.md.
+- IMG_4026 in BeachWalk has no overlap with anything (GPS says so).
+- Near sand in a strip can never align; seams there are soft but findable.
+- DESIGN.md says blend sigma 5 px; the blender uses sigma 2 per level. The
+  code comment documents what the code does.
+- `inlierCount` in PanoramaAligner.align is computed and never read.
+
+## Mid-flight, needs a decision
+
+- Package.swift has an uncommitted edit that did not come from this
+  session (Dropbox-synced, dated Sep 18): it adds `-O` to StitchCore in
+  Debug builds because Covey links this package by path. I left it
+  unstaged rather than commit someone else's change blind. Commit it or
+  revert it next session.
+- Images/ has a dozen untracked sets from the Italy trip (Amalfi, Rome,
+  Split, Sunrise). They stay local by design now.
 
 ## What's next
 
-- Photo sets: Images/ is now gitignored, so BeachWalk, Sunrise, the Rome and
-  Amalfi sets, and HiltonHeadHouse all stay local. Nothing to decide.
-- The open items from before, unchanged: radial distortion in bundle
-  adjustment, blender memory streaming, golden-image CI tests, app icon.
-- (done 2026-09-09) Repo going public: MIT LICENSE added, Images/ untracked
-  and ignored. HiltonHeadHouse photos remain in earlier git history.
+1. Per-channel block gains, then re-evaluate the Hilton Head sky; if it
+   holds up, make block the default.
+2. The open items from before: radial distortion in bundle adjustment,
+   blender memory streaming, golden-image CI tests, app icon.
+3. Three em-dashes remain in user-facing strings (CLI, app welcome text,
+   GPS log line).
 
 ## Committed this session
 
-39e7d06 strip mode, d87d6da GPS hints, 7a7e9d8 the /sos and /eos skills
-and this file, then this roll. All on origin/main, verified in sync at
-/eos with 39 tests green.
+edf6a3e and 18c8b84 public prep, e68d156 comment pass, then the block gain
+commit and this roll. All on origin/main, verified in sync at /eos with 42
+tests green.
